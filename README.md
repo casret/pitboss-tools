@@ -1,4 +1,4 @@
-# pitboss-pid
+# pitboss-tools
 
 Local monitoring and, eventually, supervisory temperature control for a Pit Boss
 PBV4DX vertical pellet smoker.
@@ -37,7 +37,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 The executable will be at:
 
 ```text
-target/x86_64-pc-windows-gnu/release/pitboss-pid.exe
+target/x86_64-pc-windows-gnu/release/pitboss-tools.exe
 ```
 
 ## First scan
@@ -46,13 +46,13 @@ Power on the smoker controller without starting a cook, then run from
 PowerShell:
 
 ```powershell
-pitboss-pid.exe scan --seconds 20
+pitboss-tools.exe scan --seconds 20
 ```
 
 If the filtered scan finds nothing:
 
 ```powershell
-pitboss-pid.exe scan --seconds 20 --all
+pitboss-tools.exe scan --seconds 20 --all
 ```
 
 The scanner does not connect to discovered devices.

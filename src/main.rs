@@ -8,7 +8,7 @@ mod windows_ble;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pitboss-pid",
+    name = "pitboss-tools",
     version,
     about = "Local Pit Boss smoker monitor and controller"
 )]

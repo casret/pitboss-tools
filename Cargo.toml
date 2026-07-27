@@ -1,7 +1,9 @@
 [package]
-name = "pitboss-pid"
+name = "pitboss-tools"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/casret/pitboss-tools"
 
 [dependencies]
 anyhow = "1.0.104"
