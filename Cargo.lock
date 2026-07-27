@@ -601,7 +601,6 @@ dependencies = [
  "anyhow",
  "btleplug",
  "clap",
- "futures",
  "tokio",
  "tracing",
  "tracing-subscriber",
