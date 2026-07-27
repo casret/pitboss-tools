@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[cfg(target_os = "windows")]
@@ -53,5 +53,7 @@ async fn scan(duration: Duration, all: bool) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 async fn scan(_duration: Duration, _all: bool) -> Result<()> {
-    bail!("BLE scanning currently requires the Windows build; run pitboss-pid.exe on Windows")
+    anyhow::bail!(
+        "BLE scanning currently requires the Windows build; run pitboss-pid.exe on Windows"
+    )
 }
