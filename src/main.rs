@@ -37,6 +37,13 @@ enum Command {
         #[arg(short, long, default_value_t = 10)]
         seconds: u64,
     },
+
+    /// Display pushed temperature reports without sending smoker commands.
+    Monitor {
+        /// Number of seconds to listen after connecting.
+        #[arg(short, long, default_value_t = 300)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -52,6 +59,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Scan { seconds, all } => scan(Duration::from_secs(seconds), all).await,
         Command::Inspect { seconds } => inspect(Duration::from_secs(seconds)).await,
+        Command::Monitor { seconds } => monitor(Duration::from_secs(seconds)).await,
     }
 }
 
@@ -65,6 +73,11 @@ async fn inspect(duration: Duration) -> Result<()> {
     windows_ble::inspect(duration).await
 }
 
+#[cfg(target_os = "windows")]
+async fn monitor(duration: Duration) -> Result<()> {
+    windows_ble::monitor(duration).await
+}
+
 #[cfg(not(target_os = "windows"))]
 async fn scan(_duration: Duration, _all: bool) -> Result<()> {
     anyhow::bail!(
@@ -76,5 +89,12 @@ async fn scan(_duration: Duration, _all: bool) -> Result<()> {
 async fn inspect(_duration: Duration) -> Result<()> {
     anyhow::bail!(
         "BLE inspection currently requires the Windows build; run pitboss-tools.exe on Windows"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn monitor(_duration: Duration) -> Result<()> {
+    anyhow::bail!(
+        "BLE monitoring currently requires the Windows build; run pitboss-tools.exe on Windows"
     )
 }
