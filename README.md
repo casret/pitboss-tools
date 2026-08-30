@@ -78,7 +78,7 @@ single-page dashboard on loopback. It treats probe 1 as grate ambient and probe
 2 as meat, matching this PBV4DX setup:
 
 ```powershell
-.\\pitboss-tools.exe serve --database pitboss.sqlite3 --target 225 --control
+.\pitboss-tools.exe serve --database pitboss.sqlite3 --target 225 --control
 ```
 
 The `--control` flag is required to start automatic control. Without it, the
