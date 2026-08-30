@@ -70,3 +70,40 @@ pitboss-tools.exe inspect
 Pit Boss smokers generally accept a single BLE connection. Close the Pit Boss
 mobile app and disable Bluetooth on any phone connected to the smoker before
 running the inspection.
+
+## Dashboard and guarded control
+
+The `serve` command records every temperature frame in SQLite and serves a
+single-page dashboard on loopback. It treats probe 1 as grate ambient and probe
+2 as meat, matching this PBV4DX setup:
+
+```powershell
+.\\pitboss-tools.exe serve --database pitboss.sqlite3 --target 225 --control
+```
+
+The `--control` flag is required to start automatic control. Without it, the
+server remains monitor-only. The dashboard can enable/disable control and
+change the grate target. Control adjusts only the Pit Boss factory temperature
+setpoint; it never switches mains power or directly operates the auger, fan, or
+igniter.
+
+The command password is read from `conf.toml` (ignored by Git) or the
+`PITBOSS_GRILL_PASSWORD` environment variable. A minimal config is:
+
+```toml
+grill_id = "PBL3-your-device-id"
+grill_password = "your-grill-password"
+```
+
+Keep `conf.toml` private. The server does not print the password. Its guarded
+controller stops on stale/disconnected probes, over-temperature, possible
+flameout, failed commands, and enforces 5°F setpoint increments plus a
+120-second command interval. It starts only after the smoker is already on;
+remote startup is not implemented.
+
+The SQLite `samples` table contains timestamped grate, meat, chamber, factory
+setpoint, control-enabled, and target values. The JSON endpoints are:
+
+- `GET /api/state`
+- `GET /api/history?limit=100`
+- `POST /api/control` with `{ "enabled": true, "target_f": 225 }`

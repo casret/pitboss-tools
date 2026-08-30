@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pit Boss Tools</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; background: #17191c; color: #eee; }
+    h1 { margin-bottom: .2rem; }
+    .muted { color: #a8afb8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .8rem; margin: 1.5rem 0; }
+    .card { background: #24282d; border-radius: .6rem; padding: 1rem; }
+    .label { color: #a8afb8; font-size: .85rem; }
+    .value { font-size: 2rem; font-variant-numeric: tabular-nums; margin-top: .25rem; }
+    form { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; background: #24282d; padding: 1rem; border-radius: .6rem; }
+    input, button { border: 0; border-radius: .35rem; padding: .6rem .8rem; font: inherit; }
+    input { width: 6rem; background: #111315; color: #fff; }
+    button { cursor: pointer; background: #e67e22; color: #111; font-weight: 700; }
+    button.secondary { background: #59636e; color: #fff; }
+    .status { margin: 1rem 0; min-height: 1.5rem; }
+    .fault { color: #ff8075; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
+    th, td { text-align: right; padding: .45rem; border-bottom: 1px solid #30353b; font-variant-numeric: tabular-nums; }
+    th:first-child, td:first-child { text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Pit Boss Tools</h1>
+  <div class="muted">PBV4DX local BLE monitor · grate probe 1 · meat probe 2</div>
+  <div class="grid">
+    <div class="card"><div class="label">Grate / ambient</div><div class="value" id="ambient">--</div></div>
+    <div class="card"><div class="label">Meat probe</div><div class="value" id="meat">--</div></div>
+    <div class="card"><div class="label">Factory chamber</div><div class="value" id="chamber">--</div></div>
+    <div class="card"><div class="label">Factory setpoint</div><div class="value" id="setpoint">--</div></div>
+  </div>
+  <form id="control-form">
+    <label><input type="checkbox" id="enabled"> enable guarded control</label>
+    <label>grate target <input type="number" id="target" min="130" max="350" step="5" value="225"> °F</label>
+    <button type="submit">Apply</button>
+    <button type="button" class="secondary" id="refresh">Refresh</button>
+  </form>
+  <div class="status" id="status">Connecting…</div>
+  <table>
+    <thead><tr><th>Time</th><th>Ambient</th><th>Meat</th><th>Chamber</th><th>Factory setpoint</th></tr></thead>
+    <tbody id="history"></tbody>
+  </table>
+<script>
+const $ = id => document.getElementById(id);
+const f = value => value == null ? '--' : `${value}°F`;
+const time = value => value == null ? '--' : new Date(value * 1000).toLocaleTimeString();
+function render(s) {
+  $('ambient').textContent = f(s.ambient_f);
+  $('meat').textContent = f(s.meat_f);
+  $('chamber').textContent = f(s.chamber_f);
+  $('setpoint').textContent = f(s.factory_setpoint_f);
+  $('enabled').checked = !!s.control_enabled;
+  $('target').value = s.target_f ?? 225;
+  $('status').innerHTML = s.fault ? `<span class="fault">Control stopped: ${s.fault}</span>` :
+    `Control ${s.control_enabled ? 'enabled' : 'off'} · last update ${time(s.timestamp)}`;
+}
+async function refresh() {
+  try {
+    const [state, history] = await Promise.all([fetch('/api/state').then(r => r.json()), fetch('/api/history?limit=100').then(r => r.json())]);
+    render(state);
+    $('history').innerHTML = history.reverse().map(s => `<tr><td>${time(s.timestamp)}</td><td>${f(s.ambient_f)}</td><td>${f(s.meat_f)}</td><td>${f(s.chamber_f)}</td><td>${f(s.factory_setpoint_f)}</td></tr>`).join('');
+  } catch (error) { $('status').textContent = `Dashboard unavailable: ${error}`; }
+}
+$('control-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const response = await fetch('/api/control', { method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({ enabled: $('enabled').checked, target_f: Number($('target').value) }) });
+  const body = await response.json();
+  if (!response.ok) { $('status').textContent = body.error || 'Invalid control settings'; return; }
+  render(body);
+});
+$('refresh').addEventListener('click', refresh);
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

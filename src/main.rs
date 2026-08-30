@@ -1,8 +1,12 @@
-use std::time::Duration;
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod codec;
+#[cfg(target_os = "windows")]
+mod config;
 #[cfg(target_os = "windows")]
 mod windows_ble;
 
@@ -44,6 +48,31 @@ enum Command {
         #[arg(short, long, default_value_t = 300)]
         seconds: u64,
     },
+
+    /// Set the factory controller's target temperature in Fahrenheit.
+    SetTemperature {
+        /// Factory-controller target, from 130°F through 420°F.
+        temperature: u16,
+    },
+
+    /// Run the local dashboard and optional guarded grate-temperature controller.
+    Serve {
+        /// Local address for the dashboard and JSON API.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+
+        /// SQLite database path for temperature history.
+        #[arg(long, default_value = "pitboss.sqlite3")]
+        database: PathBuf,
+
+        /// Desired grate/ambient temperature in Fahrenheit.
+        #[arg(long, default_value_t = 225)]
+        target: u16,
+
+        /// Start the guarded setpoint controller enabled.
+        #[arg(long)]
+        control: bool,
+    },
 }
 
 #[tokio::main]
@@ -60,6 +89,13 @@ async fn main() -> Result<()> {
         Command::Scan { seconds, all } => scan(Duration::from_secs(seconds), all).await,
         Command::Inspect { seconds } => inspect(Duration::from_secs(seconds)).await,
         Command::Monitor { seconds } => monitor(Duration::from_secs(seconds)).await,
+        Command::SetTemperature { temperature } => set_temperature(temperature).await,
+        Command::Serve {
+            bind,
+            database,
+            target,
+            control,
+        } => serve(bind, database, target, control).await,
     }
 }
 
@@ -76,6 +112,22 @@ async fn inspect(duration: Duration) -> Result<()> {
 #[cfg(target_os = "windows")]
 async fn monitor(duration: Duration) -> Result<()> {
     windows_ble::monitor(duration).await
+}
+
+#[cfg(target_os = "windows")]
+async fn set_temperature(temperature: u16) -> Result<()> {
+    windows_ble::set_temperature(temperature).await
+}
+
+#[cfg(target_os = "windows")]
+async fn serve(bind: SocketAddr, database: PathBuf, target: u16, control: bool) -> Result<()> {
+    windows_ble::serve(windows_ble::ServeOptions {
+        bind,
+        database,
+        target_f: target,
+        control_enabled: control,
+    })
+    .await
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -96,5 +148,19 @@ async fn inspect(_duration: Duration) -> Result<()> {
 async fn monitor(_duration: Duration) -> Result<()> {
     anyhow::bail!(
         "BLE monitoring currently requires the Windows build; run pitboss-tools.exe on Windows"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn set_temperature(_temperature: u16) -> Result<()> {
+    anyhow::bail!(
+        "BLE control currently requires the Windows build; run pitboss-tools.exe on Windows"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn serve(_bind: SocketAddr, _database: PathBuf, _target: u16, _control: bool) -> Result<()> {
+    anyhow::bail!(
+        "the dashboard currently requires the Windows build; run pitboss-tools.exe on Windows"
     )
 }
