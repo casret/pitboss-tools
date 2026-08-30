@@ -29,6 +29,14 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+
+    /// Connect to the discovered Pit Boss briefly and list its GATT services.
+    /// This sends no smoker commands.
+    Inspect {
+        /// Number of seconds to scan before selecting the smoker.
+        #[arg(short, long, default_value_t = 10)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -43,6 +51,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan { seconds, all } => scan(Duration::from_secs(seconds), all).await,
+        Command::Inspect { seconds } => inspect(Duration::from_secs(seconds)).await,
     }
 }
 
@@ -51,9 +60,21 @@ async fn scan(duration: Duration, all: bool) -> Result<()> {
     windows_ble::scan(duration, all).await
 }
 
+#[cfg(target_os = "windows")]
+async fn inspect(duration: Duration) -> Result<()> {
+    windows_ble::inspect(duration).await
+}
+
 #[cfg(not(target_os = "windows"))]
 async fn scan(_duration: Duration, _all: bool) -> Result<()> {
     anyhow::bail!(
-        "BLE scanning currently requires the Windows build; run pitboss-pid.exe on Windows"
+        "BLE scanning currently requires the Windows build; run pitboss-tools.exe on Windows"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn inspect(_duration: Duration) -> Result<()> {
+    anyhow::bail!(
+        "BLE inspection currently requires the Windows build; run pitboss-tools.exe on Windows"
     )
 }

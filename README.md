@@ -56,3 +56,17 @@ pitboss-tools.exe scan --seconds 20 --all
 ```
 
 The scanner does not connect to discovered devices.
+
+## Read-only GATT inspection
+
+After a candidate is visible, this command connects only long enough to list
+its BLE services and characteristics, then disconnects. It does not read,
+subscribe to, or write any characteristic and does not send smoker commands:
+
+```powershell
+pitboss-tools.exe inspect
+```
+
+Pit Boss smokers generally accept a single BLE connection. Close the Pit Boss
+mobile app and disable Bluetooth on any phone connected to the smoker before
+running the inspection.
