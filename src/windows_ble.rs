@@ -598,6 +598,19 @@ pub struct ServeOptions {
     pub control_enabled: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+struct PidTelemetry {
+    control_error_f: Option<f64>,
+    integral: f64,
+    proportional_term_f: f64,
+    integral_term_f: f64,
+    derivative_term_f: f64,
+    adjustment_f: f64,
+    recommended_factory_f: Option<u16>,
+    last_control_at: Option<i64>,
+    last_control_action: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct DashboardState {
     timestamp: Option<i64>,
@@ -609,6 +622,8 @@ struct DashboardState {
     target_f: u16,
     last_command_at: Option<i64>,
     fault: Option<String>,
+    #[serde(flatten)]
+    pid: PidTelemetry,
 }
 
 #[derive(Clone, Debug)]
@@ -621,6 +636,7 @@ struct ControlSettings {
     last_command_epoch: Option<i64>,
     last_sample_at: Option<Instant>,
     fault: Option<String>,
+    pid: PidTelemetry,
 }
 
 #[derive(Clone)]
@@ -639,6 +655,23 @@ struct StoredSample {
     factory_setpoint_f: Option<u16>,
     control_enabled: bool,
     target_f: u16,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoredControlEvent {
+    timestamp: i64,
+    target_f: u16,
+    ambient_f: Option<u16>,
+    factory_setpoint_f: Option<u16>,
+    control_error_f: Option<f64>,
+    integral: f64,
+    proportional_term_f: f64,
+    integral_term_f: f64,
+    derivative_term_f: f64,
+    adjustment_f: f64,
+    recommended_factory_f: Option<u16>,
+    action: String,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,7 +717,24 @@ fn init_database(path: &Path) -> Result<Connection> {
              control_enabled INTEGER NOT NULL,
              target_f INTEGER NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS samples_timestamp ON samples(timestamp);",
+         CREATE INDEX IF NOT EXISTS samples_timestamp ON samples(timestamp);
+         CREATE TABLE IF NOT EXISTS control_events (
+             id INTEGER PRIMARY KEY,
+             timestamp INTEGER NOT NULL,
+             target_f INTEGER NOT NULL,
+             ambient_f INTEGER,
+             factory_setpoint_f INTEGER,
+             control_error_f REAL,
+             integral REAL NOT NULL,
+             proportional_term_f REAL NOT NULL,
+             integral_term_f REAL NOT NULL,
+             derivative_term_f REAL NOT NULL,
+             adjustment_f REAL NOT NULL,
+             recommended_factory_f INTEGER,
+             action TEXT NOT NULL,
+             reason TEXT
+         );
+         CREATE INDEX IF NOT EXISTS control_events_timestamp ON control_events(timestamp);",
     )?;
     Ok(connection)
 }
@@ -694,6 +744,7 @@ fn project_control(latest: &mut DashboardState, settings: &ControlSettings) {
     latest.target_f = settings.target_f;
     latest.last_command_at = settings.last_command_epoch;
     latest.fault = settings.fault.clone();
+    latest.pid = settings.pid.clone();
 }
 
 fn record_sample(state: &WebState, report: &TemperatureReport) -> Result<()> {
@@ -749,12 +800,57 @@ fn record_sample(state: &WebState, report: &TemperatureReport) -> Result<()> {
     Ok(())
 }
 
+fn record_control_event(state: &WebState, event: &StoredControlEvent) -> Result<()> {
+    state
+        .database
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database lock poisoned"))?
+        .execute(
+            "INSERT INTO control_events
+             (timestamp, target_f, ambient_f, factory_setpoint_f,
+              control_error_f, integral, proportional_term_f, integral_term_f,
+              derivative_term_f, adjustment_f, recommended_factory_f, action, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                event.timestamp,
+                i64::from(event.target_f),
+                event.ambient_f.map(i64::from),
+                event.factory_setpoint_f.map(i64::from),
+                event.control_error_f,
+                event.integral,
+                event.proportional_term_f,
+                event.integral_term_f,
+                event.derivative_term_f,
+                event.adjustment_f,
+                event.recommended_factory_f.map(i64::from),
+                event.action,
+                event.reason,
+            ],
+        )?;
+    Ok(())
+}
+
+fn publish_pid_status(state: &WebState, telemetry: PidTelemetry) {
+    if let Ok(mut settings) = state.settings.lock() {
+        settings.integral = telemetry.integral;
+        settings.pid = telemetry.clone();
+        if let Ok(mut latest) = state.latest.lock() {
+            latest.pid = telemetry;
+        }
+    }
+}
+
 fn stop_control(state: &WebState, reason: impl Into<String>) {
     let reason = reason.into();
     let settings_snapshot = match state.settings.lock() {
         Ok(mut settings) => {
             settings.enabled = false;
             settings.fault = Some(reason);
+            settings.pid.last_control_at = Some(epoch_now());
+            settings.pid.last_control_action = settings
+                .fault
+                .as_ref()
+                .map(|fault| format!("stopped: {fault}"));
             settings.clone()
         }
         Err(_) => return,
@@ -790,6 +886,7 @@ async fn api_state(State(state): State<WebState>) -> Json<DashboardState> {
             target_f: 225,
             last_command_at: None,
             fault: Some("dashboard state unavailable".to_owned()),
+            pid: PidTelemetry::default(),
         });
     Json(snapshot)
 }
@@ -839,6 +936,49 @@ fn api_internal_error(message: impl Into<String>) -> (StatusCode, Json<ApiError>
     )
 }
 
+async fn api_control_events(
+    State(state): State<WebState>,
+    Query(query): Query<HistoryQuery>,
+) -> std::result::Result<Json<Vec<StoredControlEvent>>, (StatusCode, Json<ApiError>)> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| api_internal_error("database lock poisoned"))?;
+    let mut statement = database
+        .prepare(
+            "SELECT timestamp, target_f, ambient_f, factory_setpoint_f,
+                    control_error_f, integral, proportional_term_f, integral_term_f,
+                    derivative_term_f, adjustment_f, recommended_factory_f, action, reason
+             FROM control_events ORDER BY timestamp DESC, id DESC LIMIT ?1",
+        )
+        .map_err(|error| api_internal_error(error.to_string()))?;
+    let rows = statement
+        .query_map(params![limit as i64], |row| {
+            Ok(StoredControlEvent {
+                timestamp: row.get(0)?,
+                target_f: row.get(1)?,
+                ambient_f: row.get::<_, Option<u16>>(2)?,
+                factory_setpoint_f: row.get::<_, Option<u16>>(3)?,
+                control_error_f: row.get(4)?,
+                integral: row.get(5)?,
+                proportional_term_f: row.get(6)?,
+                integral_term_f: row.get(7)?,
+                derivative_term_f: row.get(8)?,
+                adjustment_f: row.get(9)?,
+                recommended_factory_f: row.get::<_, Option<u16>>(10)?,
+                action: row.get(11)?,
+                reason: row.get(12)?,
+            })
+        })
+        .map_err(|error| api_internal_error(error.to_string()))?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|error| api_internal_error(error.to_string()))?);
+    }
+    Ok(Json(result))
+}
+
 async fn api_control(
     State(state): State<WebState>,
     Json(request): Json<ControlRequest>,
@@ -862,6 +1002,13 @@ async fn api_control(
         settings.enabled = enabled;
         settings.fault = None;
         settings.integral = 0.0;
+        settings.pid.integral = 0.0;
+        settings.pid.last_control_at = Some(epoch_now());
+        settings.pid.last_control_action = Some(if enabled {
+            "enabled from dashboard".to_owned()
+        } else {
+            "disabled from dashboard".to_owned()
+        });
         if enabled {
             settings.started_at = Instant::now();
         }
@@ -991,6 +1138,10 @@ async fn run_controller(state: WebState) -> Result<()> {
     result
 }
 
+const KP: f64 = 0.70;
+const KI: f64 = 0.05;
+const CONTROL_INTERVAL_MINUTES: f64 = 0.5;
+
 async fn guarded_control_tick(
     state: &WebState,
     smoker: &Peripheral,
@@ -1038,57 +1189,120 @@ async fn guarded_control_tick(
         return;
     }
     let Some(factory) = latest.factory_setpoint_f else {
+        let mut telemetry = settings.pid;
+        telemetry.last_control_at = Some(epoch_now());
+        telemetry.last_control_action = Some("waiting for factory setpoint".to_owned());
+        publish_pid_status(state, telemetry);
         return;
     };
-    if settings
-        .last_command_at
-        .is_some_and(|last| last.elapsed() < Duration::from_secs(120))
-    {
-        return;
-    }
 
     let error = f64::from(settings.target_f) - f64::from(ambient);
-    let integral = (settings.integral + error * 0.5).clamp(-100.0, 100.0);
-    let adjustment = (0.70 * error + 0.05 * integral).clamp(-10.0, 10.0);
+    let integral = (settings.integral + error * CONTROL_INTERVAL_MINUTES).clamp(-100.0, 100.0);
+    let proportional_term = KP * error;
+    let integral_term = KI * integral;
+    // Derivative is deliberately disabled for this first controller: the
+    // smoker's discrete, slow response makes probe noise more harmful than
+    // useful. The zero term is still exported so the complete calculation is
+    // visible in the dashboard and database.
+    let derivative_term = 0.0;
+    let adjustment = (proportional_term + integral_term + derivative_term).clamp(-10.0, 10.0);
     let desired =
         (((f64::from(factory) + adjustment) / 5.0).round() as i32 * 5).clamp(130, 420) as u16;
-    if desired == factory || error.abs() < 2.0 {
-        if let Ok(mut current) = state.settings.lock() {
-            current.integral = integral;
+    let command_rate_limited = settings
+        .last_command_at
+        .is_some_and(|last| last.elapsed() < Duration::from_secs(120));
+    let within_deadband = error.abs() < 2.0;
+    let mut telemetry = PidTelemetry {
+        control_error_f: Some(error),
+        integral,
+        proportional_term_f: proportional_term,
+        integral_term_f: integral_term,
+        derivative_term_f: derivative_term,
+        adjustment_f: adjustment,
+        recommended_factory_f: Some(desired),
+        last_control_at: Some(epoch_now()),
+        last_control_action: None,
+    };
+    let mut event = StoredControlEvent {
+        timestamp: epoch_now(),
+        target_f: settings.target_f,
+        ambient_f: Some(ambient),
+        factory_setpoint_f: Some(factory),
+        control_error_f: Some(error),
+        integral,
+        proportional_term_f: proportional_term,
+        integral_term_f: integral_term,
+        derivative_term_f: derivative_term,
+        adjustment_f: adjustment,
+        recommended_factory_f: Some(desired),
+        action: String::new(),
+        reason: None,
+    };
+
+    if within_deadband {
+        telemetry.last_control_action = Some("hold: within deadband".to_owned());
+        event.action = "hold".to_owned();
+        event.reason = Some("within ±2°F deadband".to_owned());
+    } else if desired == factory {
+        telemetry.last_control_action = Some("hold: setpoint unchanged".to_owned());
+        event.action = "hold".to_owned();
+        event.reason = Some("calculated setpoint rounds to current value".to_owned());
+    } else if command_rate_limited {
+        telemetry.last_control_action = Some("hold: command rate limited".to_owned());
+        event.action = "rate_limited".to_owned();
+        event.reason = Some("minimum 120-second command interval".to_owned());
+    } else {
+        telemetry.last_control_action = Some("command pending".to_owned());
+        match send_authenticated_temperature(
+            smoker,
+            rpc_data,
+            rpc_tx,
+            rpc_rx_uuid,
+            notifications,
+            desired,
+        )
+        .await
+        {
+            Ok(()) => {
+                let now = Instant::now();
+                let epoch = epoch_now();
+                if let Ok(mut current) = state.settings.lock() {
+                    current.last_command_at = Some(now);
+                    current.last_command_epoch = Some(epoch);
+                    current.fault = None;
+                    current.integral = integral;
+                    telemetry.last_control_at = Some(epoch);
+                    telemetry.last_control_action =
+                        Some(format!("command accepted: factory {desired}°F"));
+                    current.pid = telemetry.clone();
+                    let snapshot = current.clone();
+                    if let Ok(mut dashboard) = state.latest.lock() {
+                        project_control(&mut dashboard, &snapshot);
+                    }
+                }
+                event.action = "setpoint_command".to_owned();
+                event.reason = Some(format!("requested factory setpoint {desired}°F"));
+                println!(
+                    "Guarded controller requested factory setpoint {desired}°F (grate {ambient}°F, target {}°F)",
+                    settings.target_f
+                );
+            }
+            Err(error) => {
+                let reason = format!("setpoint command failed: {error}");
+                stop_control(state, reason.clone());
+                telemetry.last_control_action = Some(format!("stopped: {reason}"));
+                event.action = "stopped".to_owned();
+                event.reason = Some(reason);
+            }
         }
-        return;
     }
+
     if let Ok(mut current) = state.settings.lock() {
         current.integral = integral;
     }
-    match send_authenticated_temperature(
-        smoker,
-        rpc_data,
-        rpc_tx,
-        rpc_rx_uuid,
-        notifications,
-        desired,
-    )
-    .await
-    {
-        Ok(()) => {
-            let now = Instant::now();
-            let epoch = epoch_now();
-            if let Ok(mut current) = state.settings.lock() {
-                current.last_command_at = Some(now);
-                current.last_command_epoch = Some(epoch);
-                current.fault = None;
-                let snapshot = current.clone();
-                if let Ok(mut latest) = state.latest.lock() {
-                    project_control(&mut latest, &snapshot);
-                }
-            }
-            println!(
-                "Guarded controller requested factory setpoint {desired}°F (grate {ambient}°F, target {}°F)",
-                settings.target_f
-            );
-        }
-        Err(error) => stop_control(state, format!("setpoint command failed: {error}")),
+    publish_pid_status(state, telemetry);
+    if let Err(error) = record_control_event(state, &event) {
+        eprintln!("Could not save control calculation: {error:#}");
     }
 }
 
@@ -1107,6 +1321,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         last_command_epoch: None,
         last_sample_at: None,
         fault: None,
+        pid: PidTelemetry::default(),
     };
     let latest = DashboardState {
         timestamp: None,
@@ -1118,6 +1333,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         target_f: settings.target_f,
         last_command_at: None,
         fault: None,
+        pid: PidTelemetry::default(),
     };
     let state = WebState {
         latest: Arc::new(Mutex::new(latest)),
@@ -1128,6 +1344,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .route("/", get(dashboard))
         .route("/api/state", get(api_state))
         .route("/api/history", get(api_history))
+        .route("/api/control-events", get(api_control_events))
         .route("/api/control", post(api_control))
         .with_state(state.clone());
     let listener = TcpListener::bind(options.bind)

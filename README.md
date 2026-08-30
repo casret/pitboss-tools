@@ -102,8 +102,12 @@ flameout, failed commands, and enforces 5°F setpoint increments plus a
 remote startup is not implemented.
 
 The SQLite `samples` table contains timestamped grate, meat, chamber, factory
-setpoint, control-enabled, and target values. The JSON endpoints are:
+setpoint, control-enabled, and target values. Each guarded-control tick is also
+written to `control_events` with the error, integral, P/I/D terms, clamped
+adjustment, recommended factory setpoint, action, and reason. The dashboard
+shows the same live calculation and history. The JSON endpoints are:
 
-- `GET /api/state`
+- `GET /api/state` (live temperatures plus the latest P/I/D calculation)
 - `GET /api/history?limit=100`
+- `GET /api/control-events?limit=100`
 - `POST /api/control` with `{ "enabled": true, "target_f": 225 }`
