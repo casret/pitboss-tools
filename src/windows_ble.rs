@@ -1077,7 +1077,7 @@ async fn api_shutdown(State(state): State<WebState>) -> StatusCode {
     // listener. The native process then exits after disconnecting BLE.
     tokio::spawn(async move {
         sleep(Duration::from_millis(100)).await;
-        shutdown.notify_waiters();
+        shutdown.notify_one();
     });
     StatusCode::NO_CONTENT
 }
