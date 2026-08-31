@@ -26,6 +26,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
+    sync::Notify,
     time::{Instant, interval, sleep, timeout},
 };
 use uuid::Uuid;
@@ -360,16 +361,14 @@ fn display_temperature(temperature: Option<u16>) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn rpc_call(
+async fn rpc_write_request(
     smoker: &Peripheral,
     rpc_data: &Characteristic,
     rpc_tx_control: &Characteristic,
-    rpc_rx_control_uuid: Uuid,
-    notifications: &mut Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
     id: u32,
     method: &str,
     params: serde_json::Value,
-) -> Result<serde_json::Value> {
+) -> Result<()> {
     let payload = serde_json::json!({
         "id": id,
         "method": method,
@@ -391,6 +390,21 @@ async fn rpc_call(
             .await
             .context("could not write Pit Boss RPC request data")?;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rpc_call(
+    smoker: &Peripheral,
+    rpc_data: &Characteristic,
+    rpc_tx_control: &Characteristic,
+    rpc_rx_control_uuid: Uuid,
+    notifications: &mut Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
+    id: u32,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    rpc_write_request(smoker, rpc_data, rpc_tx_control, id, method, params).await?;
 
     let response_length = timeout(Duration::from_secs(10), async {
         loop {
@@ -436,6 +450,18 @@ async fn rpc_call(
         .get("result")
         .cloned()
         .unwrap_or(serde_json::Value::Null))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rpc_call_without_answer(
+    smoker: &Peripheral,
+    rpc_data: &Characteristic,
+    rpc_tx_control: &Characteristic,
+    id: u32,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    rpc_write_request(smoker, rpc_data, rpc_tx_control, id, method, params).await
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -590,6 +616,114 @@ pub async fn set_temperature(temperature: u16) -> Result<()> {
     result
 }
 
+/// Read the optional Mongoose HTTP service configuration over BLE and, when
+/// requested, enable it and reboot the smoker to apply the saved config.
+///
+/// This never prints the full configuration because some firmware builds may
+/// include network credentials in a config response.
+pub async fn http_config(enable: bool) -> Result<()> {
+    let manager = Manager::new()
+        .await
+        .context("could not initialize Windows Bluetooth")?;
+    let adapter = manager
+        .adapters()
+        .await
+        .context("could not enumerate Bluetooth adapters")?
+        .into_iter()
+        .next()
+        .context("Windows reported no Bluetooth adapters")?;
+    println!("Scanning for the Pit Boss to inspect its HTTP configuration...");
+    let smoker = discover_smoker(&adapter, Duration::from_secs(10)).await?;
+    smoker.connect().await.context(
+        "could not connect to the Pit Boss; close the Pit Boss app and disable Bluetooth on any phone connected to the smoker",
+    )?;
+
+    let result = async {
+        smoker
+            .discover_services()
+            .await
+            .context("could not discover Pit Boss GATT services")?;
+        let rpc_data_uuid = Uuid::parse_str("5f6d4f53-5f52-5043-5f64-6174615f5f5f")
+            .expect("constant RPC data UUID is valid");
+        let rpc_tx_uuid = Uuid::parse_str("5f6d4f53-5f52-5043-5f74-785f63746c5f")
+            .expect("constant RPC TX UUID is valid");
+        let rpc_rx_uuid = Uuid::parse_str("5f6d4f53-5f52-5043-5f72-785f63746c5f")
+            .expect("constant RPC RX UUID is valid");
+        let services = smoker.services();
+        let find = |uuid| {
+            services
+                .iter()
+                .flat_map(|service| service.characteristics.iter())
+                .find(|characteristic| characteristic.uuid == uuid)
+                .cloned()
+        };
+        let rpc_data =
+            find(rpc_data_uuid).context("Pit Boss RPC data characteristic was not found")?;
+        let rpc_tx = find(rpc_tx_uuid).context("Pit Boss RPC TX characteristic was not found")?;
+        let rpc_rx = find(rpc_rx_uuid).context("Pit Boss RPC RX characteristic was not found")?;
+        let mut notifications = smoker
+            .notifications()
+            .await
+            .context("could not create BLE notification stream")?;
+        smoker
+            .subscribe(&rpc_rx)
+            .await
+            .context("could not subscribe to Pit Boss RPC responses")?;
+
+        let config = rpc_call(
+            &smoker,
+            &rpc_data,
+            &rpc_tx,
+            rpc_rx_uuid,
+            &mut notifications,
+            1,
+            "Config.Get",
+            serde_json::json!({"key": "http"}),
+        )
+        .await
+        .context("Pit Boss did not expose Config.Get for the HTTP service")?;
+        let http = config
+            .as_object()
+            .context("Pit Boss returned no HTTP configuration subtree")?;
+        let Some(currently_enabled) = http.get("enable").and_then(serde_json::Value::as_bool)
+        else {
+            anyhow::bail!("Pit Boss HTTP configuration has no boolean `enable` flag")
+        };
+        println!("Pit Boss HTTP service config: enable={currently_enabled}");
+        if !enable || currently_enabled {
+            return Ok(());
+        }
+
+        rpc_call(
+            &smoker,
+            &rpc_data,
+            &rpc_tx,
+            rpc_rx_uuid,
+            &mut notifications,
+            2,
+            "Config.Set",
+            serde_json::json!({"config": {"http": {"enable": true}}}),
+        )
+        .await
+        .context("Pit Boss rejected enabling its HTTP service")?;
+        println!("HTTP service enabled in volatile config; saving and rebooting the smoker...");
+        rpc_call_without_answer(
+            &smoker,
+            &rpc_data,
+            &rpc_tx,
+            3,
+            "Config.Save",
+            serde_json::json!({"reboot": true}),
+        )
+        .await
+        .context("could not send Pit Boss HTTP configuration save/reboot request")?;
+        Ok(())
+    }
+    .await;
+    smoker.disconnect().await.ok();
+    result
+}
+
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
     pub bind: SocketAddr,
@@ -644,6 +778,7 @@ struct WebState {
     latest: Arc<Mutex<DashboardState>>,
     settings: Arc<Mutex<ControlSettings>>,
     database: Arc<Mutex<Connection>>,
+    shutdown: Arc<Notify>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -936,6 +1071,17 @@ fn api_internal_error(message: impl Into<String>) -> (StatusCode, Json<ApiError>
     )
 }
 
+async fn api_shutdown(State(state): State<WebState>) -> StatusCode {
+    let shutdown = state.shutdown.clone();
+    // Let axum finish the response before the controller tears down the
+    // listener. The native process then exits after disconnecting BLE.
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        shutdown.notify_waiters();
+    });
+    StatusCode::NO_CONTENT
+}
+
 async fn api_control_events(
     State(state): State<WebState>,
     Query(query): Query<HistoryQuery>,
@@ -1127,6 +1273,10 @@ async fn run_controller(state: WebState) -> Result<()> {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     println!("Stopping dashboard and controller...");
+                    break;
+                }
+                _ = state.shutdown.notified() => {
+                    println!("Shutdown requested; disconnecting BLE and stopping dashboard...");
                     break;
                 }
             }
@@ -1339,6 +1489,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         latest: Arc::new(Mutex::new(latest)),
         settings: Arc::new(Mutex::new(settings)),
         database: Arc::new(Mutex::new(database)),
+        shutdown: Arc::new(Notify::new()),
     };
     let app = Router::new()
         .route("/", get(dashboard))
@@ -1346,6 +1497,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .route("/api/history", get(api_history))
         .route("/api/control-events", get(api_control_events))
         .route("/api/control", post(api_control))
+        .route("/api/shutdown", post(api_shutdown))
         .with_state(state.clone());
     let listener = TcpListener::bind(options.bind)
         .await

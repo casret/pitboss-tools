@@ -105,9 +105,28 @@ The SQLite `samples` table contains timestamped grate, meat, chamber, factory
 setpoint, control-enabled, and target values. Each guarded-control tick is also
 written to `control_events` with the error, integral, P/I/D terms, clamped
 adjustment, recommended factory setpoint, action, and reason. The dashboard
-shows the same live calculation and history. The JSON endpoints are:
+shows the same live calculation and history. The optional smoker-side HTTP service can be inspected over BLE with:
+
+```powershell
+.\pitboss-tools.exe http-config
+```
+
+If the firmware exposes a Mongoose `http.enable` setting, pass
+`--enable` to write that setting and reboot the smoker:
+
+```powershell
+.\pitboss-tools.exe http-config --enable
+```
+
+This command deliberately prints only the enable flag, never a full config.
+A missing `http` subtree means the firmware does not include the HTTP service;
+BLE cannot add it.
+
+The JSON endpoints are:
 
 - `GET /api/state` (live temperatures plus the latest P/I/D calculation)
 - `GET /api/history?limit=100`
 - `GET /api/control-events?limit=100`
 - `POST /api/control` with `{ "enabled": true, "target_f": 225 }`
+- `POST /api/shutdown` to stop the dashboard and BLE connection (the smoker
+  remains on its current factory setting)

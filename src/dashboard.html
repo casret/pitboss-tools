@@ -18,6 +18,7 @@
     input { width: 6rem; background: #111315; color: #fff; }
     button { cursor: pointer; background: #e67e22; color: #111; font-weight: 700; }
     button.secondary { background: #59636e; color: #fff; }
+    button.danger { background: #b83b3b; color: #fff; }
     .status { margin: 1rem 0; min-height: 1.5rem; }
     .fault { color: #ff8075; font-weight: 600; }
     .table-wrap { overflow-x: auto; }
@@ -52,6 +53,7 @@
     <label>grate target <input type="number" id="target" min="130" max="350" step="5" value="225"> °F</label>
     <button type="submit">Apply</button>
     <button type="button" class="secondary" id="refresh">Refresh</button>
+    <button type="button" class="danger" id="shutdown">Shut down app</button>
   </form>
   <div class="status" id="status">Connecting…</div>
   <h2>Temperature history</h2>
@@ -111,6 +113,15 @@ $('control-form').addEventListener('submit', async event => {
   render(body);
 });
 $('refresh').addEventListener('click', refresh);
+$('shutdown').addEventListener('click', async () => {
+  if (!confirm('Shut down the dashboard and BLE connection? The smoker will remain on its current factory setting.')) return;
+  $('status').textContent = 'Shutting down app…';
+  try {
+    await fetch('/api/shutdown', { method: 'POST' });
+  } catch (_) {
+    // The process may close before the response reaches the browser.
+  }
+});
 refresh();
 setInterval(refresh, 3000);
 </script>

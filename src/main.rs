@@ -49,6 +49,14 @@ enum Command {
         seconds: u64,
     },
 
+    /// Inspect or enable the smoker's optional local HTTP RPC service over BLE.
+    HttpConfig {
+        /// Enable the HTTP service if the firmware exposes an `http` config.
+        /// This writes flash and asks the smoker to reboot.
+        #[arg(long)]
+        enable: bool,
+    },
+
     /// Set the factory controller's target temperature in Fahrenheit.
     SetTemperature {
         /// Factory-controller target, from 130°F through 420°F.
@@ -89,6 +97,7 @@ async fn main() -> Result<()> {
         Command::Scan { seconds, all } => scan(Duration::from_secs(seconds), all).await,
         Command::Inspect { seconds } => inspect(Duration::from_secs(seconds)).await,
         Command::Monitor { seconds } => monitor(Duration::from_secs(seconds)).await,
+        Command::HttpConfig { enable } => http_config(enable).await,
         Command::SetTemperature { temperature } => set_temperature(temperature).await,
         Command::Serve {
             bind,
@@ -112,6 +121,11 @@ async fn inspect(duration: Duration) -> Result<()> {
 #[cfg(target_os = "windows")]
 async fn monitor(duration: Duration) -> Result<()> {
     windows_ble::monitor(duration).await
+}
+
+#[cfg(target_os = "windows")]
+async fn http_config(enable: bool) -> Result<()> {
+    windows_ble::http_config(enable).await
 }
 
 #[cfg(target_os = "windows")]
@@ -148,6 +162,13 @@ async fn inspect(_duration: Duration) -> Result<()> {
 async fn monitor(_duration: Duration) -> Result<()> {
     anyhow::bail!(
         "BLE monitoring currently requires the Windows build; run pitboss-tools.exe on Windows"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn http_config(_enable: bool) -> Result<()> {
+    anyhow::bail!(
+        "BLE control currently requires the Windows build; run pitboss-tools.exe on Windows"
     )
 }
 
