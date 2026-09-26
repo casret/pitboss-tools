@@ -1,21 +1,15 @@
 # pitboss-tools
 
-Local monitoring and, eventually, supervisory temperature control for a Pit Boss
+Local monitoring and guarded supervisory temperature control for a Pit Boss
 PBV4DX vertical pellet smoker.
 
-The application is a native Windows Rust binary so it can use the Windows BLE
-stack without taking the Bluetooth dongle away from Windows. It will expose a
-local web UI/API after the BLE protocol has been validated.
+The native Windows Rust binary uses the Windows BLE stack and provides a local
+web UI/API. Automatic control defaults off and only adjusts the factory
+setpoint; it never operates the auger, fan, igniter, or mains power directly.
 
-## Safety status
-
-The current implementation is **read-only**. It only scans BLE advertisements;
-it does not connect to or send commands to the smoker.
-
-Automatic control will not be enabled until temperature channels and commands
-have been verified against the physical controller. The future controller will
-adjust only the factory temperature setpoint; it will not directly operate the
-auger, fan, igniter, or mains power.
+A separate receive-only ESP32/nRF24L01+ USB-serial firmware for the original
+two-channel ThermoWorks Smoke lives in
+[firmware/thermoworks-smoke](firmware/thermoworks-smoke/README.md).
 
 ## Build
 
