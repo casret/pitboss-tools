@@ -37,10 +37,24 @@ int main() {
     assert(reading.probe1_tenths_f == 2120);
     assert(reading.probe2_tenths_f == 230);
     assert(smoke::as_tenths_f(-1, false) == 318); // -0.1°C -> 31.8°F
-    payload[15] = 1; // No second probe: firmware emits JSON null.
+    payload[15] = 2; // Any nonzero flag: firmware emits JSON null.
     assert(smoke::decode_payload(payload, sizeof(payload), reading));
     assert(!reading.probe2_connected);
-    payload[16] = 3;
-    assert(!smoke::decode_payload(payload, sizeof(payload), reading));
+    payload[16] = 3; // Any nonzero unit flag means Fahrenheit.
+    assert(smoke::decode_payload(payload, sizeof(payload), reading));
+    assert(reading.probe1_tenths_f == 1000);
+    assert(!reading.probe2_connected);
+
+    // A physical Smoke with only the lower probe connected produced this
+    // payload (address omitted). Its absent-probe flag was 3, not 1.
+    const uint8_t live_payload[smoke::kPayloadSize] = {
+        0xa2, 0x02, 0x78, 0x05, 0xb8, 0x01,
+        0xf8, 0x02, 0xee, 0x07, 0xf4, 0x01,
+        0x01, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x96, 0x00
+    };
+    assert(smoke::decode_payload(live_payload, sizeof(live_payload), reading));
+    assert(!reading.probe1_connected);
+    assert(reading.probe2_connected);
+    assert(reading.probe2_tenths_f == 760);
     return 0;
 }

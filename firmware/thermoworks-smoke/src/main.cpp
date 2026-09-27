@@ -38,6 +38,11 @@ Mode mode = Mode::Search;
 bool ready = false;
 bool signal_lost = false;
 uint8_t search_slot = 0;
+bool search_slot_active = false;
+uint32_t search_packets = 0;
+uint32_t search_crc_hits = 0;
+uint8_t search_frames_logged = 0;
+uint8_t last_crc_length = 0;
 uint8_t current_channel = 10;
 uint64_t active_id = 0;
 uint64_t candidate_id = 0;
@@ -70,6 +75,16 @@ void emit_reading(const smoke::Reading &reading) {
 }
 
 void search_next_slot() {
+    if (search_slot_active) {
+        Serial.printf("{\"event\":\"search_status\",\"channel\":%u,\"packets\":%lu,\"crc_hits\":%lu,\"last_crc_length\":%u}\n",
+                      current_channel, static_cast<unsigned long>(search_packets),
+                      static_cast<unsigned long>(search_crc_hits), last_crc_length);
+    }
+    search_packets = 0;
+    search_crc_hits = 0;
+    search_frames_logged = 0;
+    last_crc_length = 0;
+    search_slot_active = true;
     const uint8_t channel = kChannels[search_slot % 3];
     const uint8_t preamble_index = search_slot / 3;
     radio.stopListening();
@@ -130,6 +145,7 @@ void initialize_radio() {
         listen_on(kConfiguredId, kConfiguredChannel, "configured");
     } else {
         search_slot = 0;
+        search_slot_active = false;
         candidate_id = 0;
         candidate_count = 0;
         search_next_slot();
@@ -142,6 +158,31 @@ void receive_search() {
     for (uint8_t i = 0; i < 3 && radio.available(); ++i) {
         uint8_t frame[smoke::kSearchFrameSize];
         radio.read(frame, sizeof(frame));
+        ++search_packets;
+        // Upstream searches CRC positions 3..26. Count all matches, including
+        // shorter frames that cannot contain the complete Smoke payload.
+        for (uint8_t length = 3; length <= 26; ++length) {
+            const uint16_t given =
+                (static_cast<uint16_t>(frame[length]) << 8) | frame[length + 1];
+            if (smoke::crc16(frame, length) == given) {
+                ++search_crc_hits;
+                last_crc_length = length;
+                if (length == 26 && search_frames_logged < 3) {
+                    ++search_frames_logged;
+                    // Only CRC-valid full-size frames, capped per search slot.
+                    // Useful for diagnosing an unfamiliar Smoke payload.
+                    char hex[smoke::kSearchFrameSize * 2 + 1];
+                    constexpr char digits[] = "0123456789abcdef";
+                    for (size_t byte = 0; byte < sizeof(frame); ++byte) {
+                        hex[byte * 2] = digits[frame[byte] >> 4];
+                        hex[byte * 2 + 1] = digits[frame[byte] & 0xf];
+                    }
+                    hex[sizeof(frame) * 2] = '\0';
+                    Serial.printf("{\"event\":\"crc_frame\",\"channel\":%u,\"frame_hex\":\"%s\"}\n",
+                                  current_channel, hex);
+                }
+            }
+        }
         uint64_t id = 0;
         smoke::Reading reading{};
         if (!smoke::decode_search_frame(frame, sizeof(frame), id, reading)) {
@@ -230,6 +271,7 @@ void loop() {
             candidate_id = 0;
             candidate_count = 0;
             search_slot = 0;
+            search_slot_active = false;
             search_next_slot();
         }
     }

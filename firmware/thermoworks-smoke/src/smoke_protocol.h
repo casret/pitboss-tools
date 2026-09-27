@@ -38,11 +38,10 @@ inline int32_t as_tenths_f(int16_t value, bool fahrenheit) {
 // The Smoke payload's first 12 bytes are six int16 temperatures/alarms;
 // probe-presence flags are bytes 13 and 15, unit flag is byte 16.
 inline bool decode_payload(const uint8_t *payload, size_t size, Reading &out) {
-    if (payload == nullptr || size != kPayloadSize || payload[13] > 1 ||
-        payload[15] > 1 || payload[16] > 1) {
-        return false;
-    }
-    const bool fahrenheit = payload[16] == 1;
+    if (payload == nullptr || size != kPayloadSize) return false;
+    // Upstream treats zero as probe present/°C and any nonzero value as
+    // probe absent/°F. Do not reject a CRC-valid packet for non-1 flags.
+    const bool fahrenheit = payload[16] != 0;
     out.probe1_connected = payload[13] == 0;
     out.probe2_connected = payload[15] == 0;
     out.probe1_tenths_f = as_tenths_f(read_i16_le(payload), fahrenheit);

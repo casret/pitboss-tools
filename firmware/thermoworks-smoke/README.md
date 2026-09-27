@@ -9,8 +9,9 @@ This is separate from the Pit Boss BLE dashboard.
 The RF settings, CRC search, 5-byte radio ID and 21-byte payload layout follow
 [stefslon/esphome-thermoworks-smoke](https://github.com/stefslon/esphome-thermoworks-smoke/tree/9da52e863b184717864a4c9cbc4b9a72e7d79ae6)
 (MIT; see `UPSTREAM-LICENSE`). RF24 is the only external firmware library.
-Not tested against a physical Smoke yet: a successful build is **not** proof
-of receiving live packets.
+Validated with a physical original Smoke: with only the lower probe plugged in,
+the receiver reported probe 1 as `null` and probe 2 as 76.0°F, matching the
+handheld. Other transmitters and board variants have not been validated.
 
 ## Wiring
 
@@ -25,10 +26,13 @@ of receiving live packets.
 | MISO | GPIO 19 |
 | IRQ | Not connected |
 
-Use short wires and, if the module resets or reception is flaky, place a
-10–47 µF capacitor directly between its 3V3 and GND pins (observe capacitor
-polarity). The ESP32's USB-to-serial port connects to the PC; a bare WROOM
-module needs an external 3.3 V USB-UART adapter and normal flashing circuitry.
+Unplug USB before changing wiring. Inspect the radio's VCC and GND solder
+pads for a bridge before powering it, and never reuse a module that overheated
+after 5 V was applied. Use short wires and, if the module resets or reception
+is flaky, place a 10–47 µF capacitor directly between its 3V3 and GND pins
+(observe capacitor polarity). The ESP32's USB-to-serial port connects to the PC;
+a bare WROOM module needs an external 3.3 V USB-UART adapter and normal
+flashing circuitry.
 
 ## Build, flash, monitor
 
@@ -87,9 +91,14 @@ not switch to another ID.
 `probe2_f` and decimal `radio_id`. A disconnected probe is `null`, not a stale
 temperature. No clock is set on the ESP32; timestamp readings on the host.
 Other objects have an `event` field (`boot`, `radio_ready`, `search`,
-`candidate`, `listen`, `signal_lost`, `signal_restored`, `reacquire`, or
-`error`). Only firmware-emitted lines use NDJSON; the ESP32 ROM may print a few
-non-JSON bootloader lines on reset, so a host reader should skip lines that
+`search_status`, `crc_frame`, `candidate`, `listen`, `signal_lost`,
+`signal_restored`, `reacquire`, or `error`). Each `search_status` summarizes the
+last 22-second slot's raw packet count and CRC matches (CRC positions 3–26),
+which helps distinguish RF silence from decoding failures. Up to three
+`crc_frame` events per slot include CRC-validated raw hex to diagnose payload
+variants; this contains the transmitter's radio ID. Only firmware-emitted
+lines use NDJSON; the ESP32 ROM may print a few non-JSON bootloader lines on
+reset, so a host reader should skip lines that
 aren't JSON objects. `CORE_DEBUG_LEVEL=0` suppresses framework debug output.
 The firmware has no Node/Rust dependency; either can consume this line stream.
 
