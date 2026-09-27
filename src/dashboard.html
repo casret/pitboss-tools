@@ -14,7 +14,8 @@
     .label { color: #a8afb8; font-size: .85rem; }
     .value { font-size: 2rem; font-variant-numeric: tabular-nums; margin-top: .25rem; }
     form { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; background: #24282d; padding: 1rem; border-radius: .6rem; }
-    input, button { border: 0; border-radius: .35rem; padding: .6rem .8rem; font: inherit; }
+    input, select, button { border: 0; border-radius: .35rem; padding: .6rem .8rem; font: inherit; }
+    select { background: #111315; color: #fff; }
     input { width: 6rem; background: #111315; color: #fff; }
     button { cursor: pointer; background: #e67e22; color: #111; font-weight: 700; }
     button.secondary { background: #59636e; color: #fff; }
@@ -31,13 +32,24 @@
 </head>
 <body>
   <h1>Pit Boss Tools</h1>
-  <div class="muted">PBV4DX local BLE monitor · grate probe 1 · meat probe 2</div>
+  <div class="muted">PBV4DX local BLE monitor · passive ThermoWorks Smoke USB serial · meat: Pit Boss probe 2</div>
   <div class="grid">
     <div class="card"><div class="label">Grate / ambient</div><div class="value" id="ambient">--</div></div>
     <div class="card"><div class="label">Meat probe</div><div class="value" id="meat">--</div></div>
     <div class="card"><div class="label">Factory chamber</div><div class="value" id="chamber">--</div></div>
     <div class="card"><div class="label">Factory setpoint</div><div class="value" id="setpoint">--</div></div>
   </div>
+  <form id="source-form">
+    <label>Grate source <select id="grate-source">
+      <option value="smoke_bottom">Smoke bottom / probe 2 (default)</option>
+      <option value="smoke_top">Smoke top / probe 1</option>
+      <option value="pit_boss_probe1">Pit Boss probe 1</option>
+      <option value="pit_boss_probe2">Pit Boss probe 2</option>
+    </select></label>
+    <button type="submit" class="secondary">Use this source</button>
+    <span class="muted">Changing source turns control off; no automatic fallback.</span>
+  </form>
+  <div class="muted" id="sensor-details">Waiting for sensor data…</div>
   <h2>Guarded PI calculation</h2>
   <div class="grid">
     <div class="card"><div class="label">Error (target − grate)</div><div class="value" id="error">--</div></div>
@@ -58,23 +70,25 @@
   <div class="status" id="status">Connecting…</div>
   <h2>Temperature history</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Time</th><th>Ambient</th><th>Meat</th><th>Chamber</th><th>Factory setpoint</th></tr></thead>
+    <thead><tr><th>Time</th><th>Grate source</th><th>Ambient</th><th>Meat</th><th>Chamber</th><th>Factory setpoint</th></tr></thead>
     <tbody id="history"></tbody>
   </table></div>
   <h2>Control calculations</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Time</th><th>Ambient</th><th>Error</th><th>P</th><th>I</th><th>D</th><th>Adjustment</th><th>Recommended</th><th>Action</th><th>Reason</th></tr></thead>
+    <thead><tr><th>Time</th><th>Grate source</th><th>Ambient</th><th>Error</th><th>P</th><th>I</th><th>D</th><th>Adjustment</th><th>Recommended</th><th>Action</th><th>Reason</th></tr></thead>
     <tbody id="events"></tbody>
   </table></div>
 <script>
 const $ = id => document.getElementById(id);
-const f = value => value == null ? '--' : `${value}°F`;
+const f = value => value == null ? '--' : `${Number(value).toFixed(1)}°F`;
 const signed = value => value == null ? '--' : `${Number(value).toFixed(2)}°F`;
 const number = value => value == null ? '--' : Number(value).toFixed(2);
 const time = value => value == null ? '--' : new Date(value * 1000).toLocaleTimeString();
 const escapeHtml = value => String(value ?? '--').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 function render(s) {
   $('ambient').textContent = f(s.ambient_f);
+  $('grate-source').value = s.grate_source;
+  $('sensor-details').textContent = `Smoke ${s.smoke_status} (last reading ${time(s.smoke_timestamp)}): top ${f(s.smoke_probe1_f)}, bottom ${f(s.smoke_probe2_f)} · Pit Boss: probe 1 ${f(s.pit_boss_probe1_f)}, probe 2 ${f(s.pit_boss_probe2_f)}`;
   $('meat').textContent = f(s.meat_f);
   $('chamber').textContent = f(s.chamber_f);
   $('setpoint').textContent = f(s.factory_setpoint_f);
@@ -91,7 +105,7 @@ function render(s) {
     `Control ${s.control_enabled ? 'enabled' : 'off'} · ${escapeHtml(s.last_control_action || 'no calculation yet')} · last update ${time(s.timestamp)}`;
 }
 function renderEvents(events) {
-  $('events').innerHTML = events.map(event => `<tr><td>${time(event.timestamp)}</td><td>${f(event.ambient_f)}</td><td>${signed(event.control_error_f)}</td><td>${signed(event.proportional_term_f)}</td><td>${signed(event.integral_term_f)}</td><td>${signed(event.derivative_term_f)}</td><td>${signed(event.adjustment_f)}</td><td>${f(event.recommended_factory_f)}</td><td>${escapeHtml(event.action)}</td><td>${escapeHtml(event.reason)}</td></tr>`).join('');
+  $('events').innerHTML = events.map(event => `<tr><td>${time(event.timestamp)}</td><td>${escapeHtml(event.grate_source)}</td><td>${f(event.ambient_f)}</td><td>${signed(event.control_error_f)}</td><td>${signed(event.proportional_term_f)}</td><td>${signed(event.integral_term_f)}</td><td>${signed(event.derivative_term_f)}</td><td>${signed(event.adjustment_f)}</td><td>${f(event.recommended_factory_f)}</td><td>${escapeHtml(event.action)}</td><td>${escapeHtml(event.reason)}</td></tr>`).join('');
 }
 async function refresh() {
   try {
@@ -102,9 +116,16 @@ async function refresh() {
     ]);
     render(state);
     renderEvents(events);
-    $('history').innerHTML = history.reverse().map(s => `<tr><td>${time(s.timestamp)}</td><td>${f(s.ambient_f)}</td><td>${f(s.meat_f)}</td><td>${f(s.chamber_f)}</td><td>${f(s.factory_setpoint_f)}</td></tr>`).join('');
+    $('history').innerHTML = history.reverse().map(s => `<tr><td>${time(s.timestamp)}</td><td>${escapeHtml(s.grate_source)}</td><td>${f(s.ambient_f)}</td><td>${f(s.meat_f)}</td><td>${f(s.chamber_f)}</td><td>${f(s.factory_setpoint_f)}</td></tr>`).join('');
   } catch (error) { $('status').textContent = `Dashboard unavailable: ${error}`; }
 }
+$('source-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const response = await fetch('/api/control', { method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({ grate_source: $('grate-source').value }) });
+  const body = await response.json();
+  if (!response.ok) { $('status').textContent = body.error || 'Could not select grate source'; return; }
+  render(body);
+});
 $('control-form').addEventListener('submit', async event => {
   event.preventDefault();
   const response = await fetch('/api/control', { method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({ enabled: $('enabled').checked, target_f: Number($('target').value) }) });

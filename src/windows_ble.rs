@@ -2,7 +2,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,12 +29,15 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    sync::Notify,
+    sync::{Notify, mpsc},
     time::{Instant, interval, sleep, timeout},
 };
 use uuid::Uuid;
 
-use crate::{codec, config};
+use crate::{codec, config, windows_smoke};
+
+const BLE_STALE: Duration = Duration::from_secs(60);
+const SMOKE_STALE: Duration = Duration::from_secs(30);
 
 const PIT_BOSS_NAME_MARKERS: &[&str] =
     &["pit boss", "pitboss", "pbv4", "pbl", "dansons", "mongoose"];
@@ -730,6 +736,28 @@ pub struct ServeOptions {
     pub database: PathBuf,
     pub target_f: u16,
     pub control_enabled: bool,
+    pub smoke_port: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum GrateSource {
+    #[default]
+    SmokeBottom,
+    SmokeTop,
+    PitBossProbe1,
+    PitBossProbe2,
+}
+
+impl GrateSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SmokeBottom => "smoke_bottom",
+            Self::SmokeTop => "smoke_top",
+            Self::PitBossProbe1 => "pit_boss_probe1",
+            Self::PitBossProbe2 => "pit_boss_probe2",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -748,8 +776,15 @@ struct PidTelemetry {
 #[derive(Clone, Debug, Serialize)]
 struct DashboardState {
     timestamp: Option<i64>,
-    ambient_f: Option<u16>,
+    ambient_f: Option<f64>,
     meat_f: Option<u16>,
+    pit_boss_probe1_f: Option<u16>,
+    pit_boss_probe2_f: Option<u16>,
+    smoke_probe1_f: Option<f64>,
+    smoke_probe2_f: Option<f64>,
+    smoke_timestamp: Option<i64>,
+    smoke_status: String,
+    grate_source: GrateSource,
     chamber_f: Option<u16>,
     factory_setpoint_f: Option<u16>,
     control_enabled: bool,
@@ -764,8 +799,10 @@ struct DashboardState {
 struct ControlSettings {
     enabled: bool,
     target_f: u16,
+    grate_source: GrateSource,
+    generation: u64,
+    command_in_flight: bool,
     integral: f64,
-    started_at: Instant,
     last_command_at: Option<Instant>,
     last_command_epoch: Option<i64>,
     last_sample_at: Option<Instant>,
@@ -777,14 +814,26 @@ struct ControlSettings {
 struct WebState {
     latest: Arc<Mutex<DashboardState>>,
     settings: Arc<Mutex<ControlSettings>>,
+    smoke: Arc<Mutex<SmokeCache>>,
     database: Arc<Mutex<Connection>>,
     shutdown: Arc<Notify>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SmokeCache {
+    probe1_f: Option<f64>,
+    probe2_f: Option<f64>,
+    last_at: Option<Instant>,
+    timestamp: Option<i64>,
+    radio_id: Option<u64>,
+    connected: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct StoredSample {
     timestamp: i64,
-    ambient_f: Option<u16>,
+    ambient_f: Option<f64>,
+    grate_source: String,
     meat_f: Option<u16>,
     chamber_f: Option<u16>,
     factory_setpoint_f: Option<u16>,
@@ -796,7 +845,8 @@ struct StoredSample {
 struct StoredControlEvent {
     timestamp: i64,
     target_f: u16,
-    ambient_f: Option<u16>,
+    ambient_f: Option<f64>,
+    grate_source: String,
     factory_setpoint_f: Option<u16>,
     control_error_f: Option<f64>,
     integral: f64,
@@ -818,6 +868,7 @@ struct HistoryQuery {
 struct ControlRequest {
     enabled: Option<bool>,
     target_f: Option<u16>,
+    grate_source: Option<GrateSource>,
 }
 
 #[derive(Debug, Serialize)]
@@ -830,6 +881,83 @@ fn epoch_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn fresh_grate(
+    source: GrateSource,
+    pit_boss_probe1: Option<u16>,
+    pit_boss_probe2: Option<u16>,
+    last_ble_at: Option<Instant>,
+    smoke: &SmokeCache,
+) -> Option<f64> {
+    match source {
+        GrateSource::PitBossProbe1 | GrateSource::PitBossProbe2 => {
+            last_ble_at.filter(|at| at.elapsed() <= BLE_STALE)?;
+            match source {
+                GrateSource::PitBossProbe1 => pit_boss_probe1,
+                _ => pit_boss_probe2,
+            }
+            .map(f64::from)
+        }
+        GrateSource::SmokeBottom | GrateSource::SmokeTop => {
+            smoke.last_at.filter(|at| at.elapsed() <= SMOKE_STALE)?;
+            match source {
+                GrateSource::SmokeBottom => smoke.probe2_f,
+                _ => smoke.probe1_f,
+            }
+        }
+    }
+}
+
+fn control_sensor_fault(grate: f64, chamber: u16, target: u16) -> Option<&'static str> {
+    if !grate.is_finite() || grate >= 400.0 || chamber >= 420 {
+        return Some("over-temperature safety limit reached");
+    }
+    if chamber < 100 {
+        return Some("possible flameout: factory chamber below 100°F");
+    }
+    if chamber > target.saturating_add(100) {
+        return Some("factory chamber more than 100°F above grate target");
+    }
+    if (grate - f64::from(chamber)).abs() > 100.0 {
+        return Some("selected grate probe disagrees with factory chamber by over 100°F");
+    }
+    None
+}
+
+fn refresh_readings(latest: &mut DashboardState, settings: &ControlSettings, smoke: &SmokeCache) {
+    let smoke_fresh = smoke.last_at.is_some_and(|at| at.elapsed() <= SMOKE_STALE);
+    let ble_fresh = settings
+        .last_sample_at
+        .is_some_and(|at| at.elapsed() <= BLE_STALE);
+    latest.grate_source = settings.grate_source;
+    latest.smoke_probe1_f = smoke_fresh.then_some(smoke.probe1_f).flatten();
+    latest.smoke_probe2_f = smoke_fresh.then_some(smoke.probe2_f).flatten();
+    latest.smoke_timestamp = smoke.timestamp;
+    latest.smoke_status = if smoke_fresh {
+        "live"
+    } else if smoke.last_at.is_some() {
+        "stale"
+    } else if smoke.connected {
+        "searching"
+    } else {
+        "disconnected"
+    }
+    .to_owned();
+    latest.meat_f = ble_fresh.then_some(latest.pit_boss_probe2_f).flatten();
+    latest.ambient_f = fresh_grate(
+        settings.grate_source,
+        latest.pit_boss_probe1_f,
+        latest.pit_boss_probe2_f,
+        settings.last_sample_at,
+        smoke,
+    );
+    if !ble_fresh {
+        latest.pit_boss_probe1_f = None;
+        latest.pit_boss_probe2_f = None;
+        latest.chamber_f = None;
+        latest.factory_setpoint_f = None;
+    }
 }
 
 fn init_database(path: &Path) -> Result<Connection> {
@@ -869,8 +997,35 @@ fn init_database(path: &Path) -> Result<Connection> {
              action TEXT NOT NULL,
              reason TEXT
          );
-         CREATE INDEX IF NOT EXISTS control_events_timestamp ON control_events(timestamp);",
+         CREATE INDEX IF NOT EXISTS control_events_timestamp ON control_events(timestamp);
+         CREATE TABLE IF NOT EXISTS smoke_samples (
+             id INTEGER PRIMARY KEY,
+             timestamp INTEGER NOT NULL,
+             probe1_f REAL,
+             probe2_f REAL
+         );
+         CREATE INDEX IF NOT EXISTS smoke_samples_timestamp ON smoke_samples(timestamp);",
     )?;
+    let has_source: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('samples') WHERE name = 'grate_source'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_source == 0 {
+        connection.execute_batch(
+            "ALTER TABLE samples ADD COLUMN grate_source TEXT NOT NULL DEFAULT 'pit_boss_probe1'",
+        )?;
+    }
+    let has_control_source: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('control_events') WHERE name = 'grate_source'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_control_source == 0 {
+        connection.execute_batch(
+            "ALTER TABLE control_events ADD COLUMN grate_source TEXT NOT NULL DEFAULT 'pit_boss_probe1'",
+        )?;
+    }
     Ok(connection)
 }
 
@@ -892,25 +1047,33 @@ fn record_sample(state: &WebState, report: &TemperatureReport) -> Result<()> {
         settings.last_sample_at = Some(Instant::now());
         settings.clone()
     };
-    let sample = StoredSample {
+    let mut sample = StoredSample {
         timestamp,
-        ambient_f: report.probe_1,
+        ambient_f: None,
+        grate_source: settings_snapshot.grate_source.as_str().to_owned(),
         meat_f: report.probe_2,
         chamber_f: report.chamber,
         factory_setpoint_f: report.setpoint,
         control_enabled: settings_snapshot.enabled,
         target_f: settings_snapshot.target_f,
     };
+    let smoke_snapshot = state
+        .smoke
+        .lock()
+        .map_err(|_| anyhow::anyhow!("smoke sensor lock poisoned"))?
+        .clone();
     {
         let mut latest = state
             .latest
             .lock()
             .map_err(|_| anyhow::anyhow!("dashboard state lock poisoned"))?;
         latest.timestamp = Some(sample.timestamp);
-        latest.ambient_f = sample.ambient_f;
-        latest.meat_f = sample.meat_f;
+        latest.pit_boss_probe1_f = report.probe_1;
+        latest.pit_boss_probe2_f = report.probe_2;
         latest.chamber_f = sample.chamber_f;
         latest.factory_setpoint_f = sample.factory_setpoint_f;
+        refresh_readings(&mut latest, &settings_snapshot, &smoke_snapshot);
+        sample.ambient_f = latest.ambient_f;
         project_control(&mut latest, &settings_snapshot);
     }
     state
@@ -920,18 +1083,95 @@ fn record_sample(state: &WebState, report: &TemperatureReport) -> Result<()> {
         .execute(
             "INSERT INTO samples
              (timestamp, ambient_f, meat_f, chamber_f, factory_setpoint_f,
-              control_enabled, target_f)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              control_enabled, target_f, grate_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sample.timestamp,
-                sample.ambient_f.map(i64::from),
+                sample.ambient_f,
                 sample.meat_f.map(i64::from),
                 sample.chamber_f.map(i64::from),
                 sample.factory_setpoint_f.map(i64::from),
                 sample.control_enabled as i64,
                 i64::from(sample.target_f),
+                sample.grate_source,
             ],
         )?;
+    Ok(())
+}
+
+fn record_smoke_event(state: &WebState, event: windows_smoke::Event) -> Result<()> {
+    let settings_snapshot = state
+        .settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("control settings lock poisoned"))?
+        .clone();
+    let mut smoke = state
+        .smoke
+        .lock()
+        .map_err(|_| anyhow::anyhow!("smoke sensor lock poisoned"))?;
+    let mut sensor_fault = false;
+    let mut logged_reading = None;
+    match event {
+        windows_smoke::Event::Connected => {
+            smoke.connected = true;
+            smoke.last_at = None;
+            smoke.probe1_f = None;
+            smoke.probe2_f = None;
+        }
+        windows_smoke::Event::Disconnected => {
+            smoke.connected = false;
+            smoke.last_at = None;
+            smoke.probe1_f = None;
+            smoke.probe2_f = None;
+            sensor_fault = true;
+        }
+        windows_smoke::Event::Reading(reading) => {
+            if smoke.radio_id.is_some_and(|id| id != reading.radio_id) {
+                sensor_fault = true;
+                smoke.last_at = None;
+                smoke.probe1_f = None;
+                smoke.probe2_f = None;
+            } else {
+                smoke.radio_id = Some(reading.radio_id);
+                smoke.probe1_f = reading.probe1_f;
+                smoke.probe2_f = reading.probe2_f;
+                smoke.last_at = Some(Instant::now());
+                smoke.timestamp = Some(epoch_now());
+                logged_reading = Some(reading);
+            }
+        }
+    }
+    let smoke_snapshot = smoke.clone();
+    drop(smoke);
+    {
+        let mut latest = state
+            .latest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dashboard state lock poisoned"))?;
+        refresh_readings(&mut latest, &settings_snapshot, &smoke_snapshot);
+    }
+    if sensor_fault
+        && settings_snapshot.enabled
+        && matches!(
+            settings_snapshot.grate_source,
+            GrateSource::SmokeBottom | GrateSource::SmokeTop
+        )
+    {
+        stop_control(
+            state,
+            "Smoke serial disconnected or transmitter identity changed",
+        );
+    }
+    if let Some(reading) = logged_reading {
+        state
+            .database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?
+            .execute(
+                "INSERT INTO smoke_samples (timestamp, probe1_f, probe2_f) VALUES (?1, ?2, ?3)",
+                params![epoch_now(), reading.probe1_f, reading.probe2_f],
+            )?;
+    }
     Ok(())
 }
 
@@ -944,12 +1184,13 @@ fn record_control_event(state: &WebState, event: &StoredControlEvent) -> Result<
             "INSERT INTO control_events
              (timestamp, target_f, ambient_f, factory_setpoint_f,
               control_error_f, integral, proportional_term_f, integral_term_f,
-              derivative_term_f, adjustment_f, recommended_factory_f, action, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              derivative_term_f, adjustment_f, recommended_factory_f, action, reason,
+              grate_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 event.timestamp,
                 i64::from(event.target_f),
-                event.ambient_f.map(i64::from),
+                event.ambient_f,
                 event.factory_setpoint_f.map(i64::from),
                 event.control_error_f,
                 event.integral,
@@ -960,13 +1201,17 @@ fn record_control_event(state: &WebState, event: &StoredControlEvent) -> Result<
                 event.recommended_factory_f.map(i64::from),
                 event.action,
                 event.reason,
+                event.grate_source,
             ],
         )?;
     Ok(())
 }
 
-fn publish_pid_status(state: &WebState, telemetry: PidTelemetry) {
+fn publish_pid_status(state: &WebState, telemetry: PidTelemetry, generation: u64) {
     if let Ok(mut settings) = state.settings.lock() {
+        if !settings.enabled || settings.generation != generation {
+            return;
+        }
         settings.integral = telemetry.integral;
         settings.pid = telemetry.clone();
         if let Ok(mut latest) = state.latest.lock() {
@@ -980,6 +1225,7 @@ fn stop_control(state: &WebState, reason: impl Into<String>) {
     let settings_snapshot = match state.settings.lock() {
         Ok(mut settings) => {
             settings.enabled = false;
+            settings.generation = settings.generation.wrapping_add(1);
             settings.fault = Some(reason);
             settings.pid.last_control_at = Some(epoch_now());
             settings.pid.last_control_action = settings
@@ -1015,6 +1261,13 @@ async fn api_state(State(state): State<WebState>) -> Json<DashboardState> {
             timestamp: None,
             ambient_f: None,
             meat_f: None,
+            pit_boss_probe1_f: None,
+            pit_boss_probe2_f: None,
+            smoke_probe1_f: None,
+            smoke_probe2_f: None,
+            smoke_timestamp: None,
+            smoke_status: "disconnected".to_owned(),
+            grate_source: GrateSource::default(),
             chamber_f: None,
             factory_setpoint_f: None,
             control_enabled: false,
@@ -1023,6 +1276,10 @@ async fn api_state(State(state): State<WebState>) -> Json<DashboardState> {
             fault: Some("dashboard state unavailable".to_owned()),
             pid: PidTelemetry::default(),
         });
+    let mut snapshot = snapshot;
+    if let (Ok(settings), Ok(smoke)) = (state.settings.lock(), state.smoke.lock()) {
+        refresh_readings(&mut snapshot, &settings, &smoke);
+    }
     Json(snapshot)
 }
 
@@ -1038,7 +1295,7 @@ async fn api_history(
     let mut statement = database
         .prepare(
             "SELECT timestamp, ambient_f, meat_f, chamber_f, factory_setpoint_f,
-                    control_enabled, target_f
+                    control_enabled, target_f, grate_source
              FROM samples ORDER BY timestamp DESC, id DESC LIMIT ?1",
         )
         .map_err(|error| api_internal_error(error.to_string()))?;
@@ -1046,12 +1303,13 @@ async fn api_history(
         .query_map(params![limit as i64], |row| {
             Ok(StoredSample {
                 timestamp: row.get(0)?,
-                ambient_f: row.get::<_, Option<u16>>(1)?,
+                ambient_f: row.get::<_, Option<f64>>(1)?,
                 meat_f: row.get::<_, Option<u16>>(2)?,
                 chamber_f: row.get::<_, Option<u16>>(3)?,
                 factory_setpoint_f: row.get::<_, Option<u16>>(4)?,
                 control_enabled: row.get::<_, i64>(5)? != 0,
                 target_f: row.get(6)?,
+                grate_source: row.get(7)?,
             })
         })
         .map_err(|error| api_internal_error(error.to_string()))?;
@@ -1095,7 +1353,8 @@ async fn api_control_events(
         .prepare(
             "SELECT timestamp, target_f, ambient_f, factory_setpoint_f,
                     control_error_f, integral, proportional_term_f, integral_term_f,
-                    derivative_term_f, adjustment_f, recommended_factory_f, action, reason
+                    derivative_term_f, adjustment_f, recommended_factory_f, action, reason,
+                    grate_source
              FROM control_events ORDER BY timestamp DESC, id DESC LIMIT ?1",
         )
         .map_err(|error| api_internal_error(error.to_string()))?;
@@ -1104,7 +1363,7 @@ async fn api_control_events(
             Ok(StoredControlEvent {
                 timestamp: row.get(0)?,
                 target_f: row.get(1)?,
-                ambient_f: row.get::<_, Option<u16>>(2)?,
+                ambient_f: row.get::<_, Option<f64>>(2)?,
                 factory_setpoint_f: row.get::<_, Option<u16>>(3)?,
                 control_error_f: row.get(4)?,
                 integral: row.get(5)?,
@@ -1115,6 +1374,7 @@ async fn api_control_events(
                 recommended_factory_f: row.get::<_, Option<u16>>(10)?,
                 action: row.get(11)?,
                 reason: row.get(12)?,
+                grate_source: row.get(13)?,
             })
         })
         .map_err(|error| api_internal_error(error.to_string()))?;
@@ -1133,18 +1393,105 @@ async fn api_control(
         .settings
         .lock()
         .map_err(|_| api_internal_error("control settings lock poisoned"))?;
-    if let Some(target) = request.target_f {
-        if !(130..=350).contains(&target) || target % 5 != 0 {
+    if settings.command_in_flight
+        && (request.enabled == Some(true)
+            || request
+                .target_f
+                .is_some_and(|target| target != settings.target_f)
+            || request
+                .grate_source
+                .is_some_and(|source| source != settings.grate_source))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "factory command is in flight; retry after it finishes".to_owned(),
+            }),
+        ));
+    }
+    if request.enabled == Some(true)
+        && request
+            .grate_source
+            .is_some_and(|source| source != settings.grate_source)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "choose a grate source first, then explicitly re-enable control".to_owned(),
+            }),
+        ));
+    }
+    let mut changed = false;
+    if let Some(target) = request.target_f
+        && (!(130..=350).contains(&target) || target % 5 != 0)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "grate target must be 130..350°F in 5°F increments".to_owned(),
+            }),
+        ));
+    }
+    if let Some(source) = request.grate_source
+        && source != settings.grate_source
+    {
+        settings.grate_source = source;
+        changed = true;
+        settings.enabled = false;
+        settings.integral = 0.0;
+        settings.pid = PidTelemetry::default();
+        settings.fault = Some("grate source changed; control is off until re-enabled".to_owned());
+    }
+    if request.enabled == Some(true) {
+        let latest = state
+            .latest
+            .lock()
+            .map_err(|_| api_internal_error("dashboard state lock poisoned"))?;
+        let pit_boss_probe1 = latest.pit_boss_probe1_f;
+        let pit_boss_probe2 = latest.pit_boss_probe2_f;
+        let factory_available = latest.factory_setpoint_f.is_some();
+        let chamber = latest.chamber_f;
+        drop(latest);
+        let smoke = state
+            .smoke
+            .lock()
+            .map_err(|_| api_internal_error("smoke sensor lock poisoned"))?;
+        let grate = fresh_grate(
+            settings.grate_source,
+            pit_boss_probe1,
+            pit_boss_probe2,
+            settings.last_sample_at,
+            &smoke,
+        );
+        if settings
+            .last_sample_at
+            .is_none_or(|at| at.elapsed() > BLE_STALE)
+            || !factory_available
+            || grate.zip(chamber).is_none_or(|(grate, chamber)| {
+                control_sensor_fault(
+                    grate,
+                    chamber,
+                    request.target_f.unwrap_or(settings.target_f),
+                )
+                .is_some()
+            })
+        {
             return Err((
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
                 Json(ApiError {
-                    error: "grate target must be 130..350°F in 5°F increments".to_owned(),
+                    error: "cannot enable control: smoker must be hot and BLE/factory telemetry and the selected grate probe must be fresh and safe".to_owned(),
                 }),
             ));
         }
+    }
+    if let Some(target) = request.target_f
+        && settings.target_f != target
+    {
         settings.target_f = target;
+        changed = true;
     }
     if let Some(enabled) = request.enabled {
+        changed = true;
         settings.enabled = enabled;
         settings.fault = None;
         settings.integral = 0.0;
@@ -1155,16 +1502,22 @@ async fn api_control(
         } else {
             "disabled from dashboard".to_owned()
         });
-        if enabled {
-            settings.started_at = Instant::now();
-        }
+    }
+    if changed {
+        settings.generation = settings.generation.wrapping_add(1);
     }
     let snapshot = settings.clone();
     drop(settings);
+    let smoke = state
+        .smoke
+        .lock()
+        .map_err(|_| api_internal_error("smoke sensor lock poisoned"))?
+        .clone();
     let mut latest = state
         .latest
         .lock()
         .map_err(|_| api_internal_error("dashboard state lock poisoned"))?;
+    refresh_readings(&mut latest, &snapshot, &smoke);
     project_control(&mut latest, &snapshot);
     Ok(Json(latest.clone()))
 }
@@ -1311,42 +1664,47 @@ async fn guarded_control_tick(
         Ok(latest) => latest.clone(),
         Err(_) => return,
     };
-    let Some(last_sample) = settings.last_sample_at else {
-        return;
-    };
-    if last_sample.elapsed() > Duration::from_secs(60) {
-        stop_control(state, "temperature sensor data is stale");
+    if settings
+        .last_sample_at
+        .is_none_or(|at| at.elapsed() > BLE_STALE)
+    {
+        stop_control(state, "Pit Boss BLE temperature data is missing or stale");
         return;
     }
-    let Some(ambient) = latest.ambient_f else {
-        stop_control(state, "grate ambient probe is disconnected");
+    let smoke = match state.smoke.lock() {
+        Ok(smoke) => smoke.clone(),
+        Err(_) => {
+            stop_control(state, "Smoke sensor state unavailable");
+            return;
+        }
+    };
+    let Some(ambient) = fresh_grate(
+        settings.grate_source,
+        latest.pit_boss_probe1_f,
+        latest.pit_boss_probe2_f,
+        settings.last_sample_at,
+        &smoke,
+    ) else {
+        stop_control(state, "selected grate probe is disconnected or stale");
         return;
     };
-    if ambient >= 400
-        || latest
-            .chamber_f
-            .is_some_and(|temperature| temperature >= 420)
-    {
-        stop_control(state, "over-temperature safety limit reached");
+    let Some(chamber) = latest.chamber_f else {
+        stop_control(state, "Pit Boss chamber sensor is disconnected");
         return;
-    }
-    if settings.started_at.elapsed() >= Duration::from_secs(300)
-        && latest
-            .chamber_f
-            .is_some_and(|temperature| temperature < 100)
-    {
-        stop_control(state, "possible flameout detected");
+    };
+    if let Some(reason) = control_sensor_fault(ambient, chamber, settings.target_f) {
+        stop_control(state, reason);
         return;
     }
     let Some(factory) = latest.factory_setpoint_f else {
         let mut telemetry = settings.pid;
         telemetry.last_control_at = Some(epoch_now());
         telemetry.last_control_action = Some("waiting for factory setpoint".to_owned());
-        publish_pid_status(state, telemetry);
+        publish_pid_status(state, telemetry, settings.generation);
         return;
     };
 
-    let error = f64::from(settings.target_f) - f64::from(ambient);
+    let error = f64::from(settings.target_f) - ambient;
     let integral = (settings.integral + error * CONTROL_INTERVAL_MINUTES).clamp(-100.0, 100.0);
     let proportional_term = KP * error;
     let integral_term = KI * integral;
@@ -1377,6 +1735,7 @@ async fn guarded_control_tick(
         timestamp: epoch_now(),
         target_f: settings.target_f,
         ambient_f: Some(ambient),
+        grate_source: settings.grate_source.as_str().to_owned(),
         factory_setpoint_f: Some(factory),
         control_error_f: Some(error),
         integral,
@@ -1402,6 +1761,15 @@ async fn guarded_control_tick(
         event.action = "rate_limited".to_owned();
         event.reason = Some("minimum 120-second command interval".to_owned());
     } else {
+        // Refuse a command calculated for a source/target that changed since
+        // the beginning of this tick. Source changes during the RPC are
+        // rejected by the dashboard until this in-flight command completes.
+        match state.settings.lock() {
+            Ok(mut current) if current.enabled && current.generation == settings.generation => {
+                current.command_in_flight = true;
+            }
+            _ => return,
+        }
         telemetry.last_control_action = Some("command pending".to_owned());
         match send_authenticated_temperature(
             smoker,
@@ -1416,22 +1784,34 @@ async fn guarded_control_tick(
             Ok(()) => {
                 let now = Instant::now();
                 let epoch = epoch_now();
+                let mut still_current = false;
                 if let Ok(mut current) = state.settings.lock() {
+                    current.command_in_flight = false;
+                    // Even if a sensor fault disabled control during the RPC,
+                    // retain the command time so re-arming cannot bypass the
+                    // 120-second rate limit.
                     current.last_command_at = Some(now);
                     current.last_command_epoch = Some(epoch);
-                    current.fault = None;
-                    current.integral = integral;
-                    telemetry.last_control_at = Some(epoch);
-                    telemetry.last_control_action =
-                        Some(format!("command accepted: factory {desired}°F"));
-                    current.pid = telemetry.clone();
+                    if current.enabled && current.generation == settings.generation {
+                        current.fault = None;
+                        current.integral = integral;
+                        telemetry.last_control_at = Some(epoch);
+                        telemetry.last_control_action =
+                            Some(format!("command accepted: factory {desired}°F"));
+                        current.pid = telemetry.clone();
+                        still_current = true;
+                    }
                     let snapshot = current.clone();
                     if let Ok(mut dashboard) = state.latest.lock() {
                         project_control(&mut dashboard, &snapshot);
                     }
                 }
                 event.action = "setpoint_command".to_owned();
-                event.reason = Some(format!("requested factory setpoint {desired}°F"));
+                event.reason = Some(if still_current {
+                    format!("requested factory setpoint {desired}°F")
+                } else {
+                    format!("factory setpoint {desired}°F accepted after control was disabled")
+                });
                 println!(
                     "Guarded controller requested factory setpoint {desired}°F (grate {ambient}°F, target {}°F)",
                     settings.target_f
@@ -1439,18 +1819,22 @@ async fn guarded_control_tick(
             }
             Err(error) => {
                 let reason = format!("setpoint command failed: {error}");
-                stop_control(state, reason.clone());
-                telemetry.last_control_action = Some(format!("stopped: {reason}"));
+                let still_current = if let Ok(mut current) = state.settings.lock() {
+                    current.command_in_flight = false;
+                    current.enabled && current.generation == settings.generation
+                } else {
+                    false
+                };
+                if still_current {
+                    stop_control(state, reason.clone());
+                }
                 event.action = "stopped".to_owned();
                 event.reason = Some(reason);
             }
         }
     }
 
-    if let Ok(mut current) = state.settings.lock() {
-        current.integral = integral;
-    }
-    publish_pid_status(state, telemetry);
+    publish_pid_status(state, telemetry, settings.generation);
     if let Err(error) = record_control_event(state, &event) {
         eprintln!("Could not save control calculation: {error:#}");
     }
@@ -1465,8 +1849,10 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let settings = ControlSettings {
         enabled: options.control_enabled,
         target_f: options.target_f,
+        grate_source: GrateSource::default(),
+        generation: 0,
+        command_in_flight: false,
         integral: 0.0,
-        started_at: Instant::now(),
         last_command_at: None,
         last_command_epoch: None,
         last_sample_at: None,
@@ -1477,6 +1863,13 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         timestamp: None,
         ambient_f: None,
         meat_f: None,
+        pit_boss_probe1_f: None,
+        pit_boss_probe2_f: None,
+        smoke_probe1_f: None,
+        smoke_probe2_f: None,
+        smoke_timestamp: None,
+        smoke_status: "disconnected".to_owned(),
+        grate_source: settings.grate_source,
         chamber_f: None,
         factory_setpoint_f: None,
         control_enabled: settings.enabled,
@@ -1488,6 +1881,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let state = WebState {
         latest: Arc::new(Mutex::new(latest)),
         settings: Arc::new(Mutex::new(settings)),
+        smoke: Arc::new(Mutex::new(SmokeCache::default())),
         database: Arc::new(Mutex::new(database)),
         shutdown: Arc::new(Notify::new()),
     };
@@ -1509,7 +1903,40 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
             .await
             .context("dashboard server stopped")
     });
-    let result = run_controller(state).await;
+    let (smoke_tx, mut smoke_rx) = mpsc::unbounded_channel();
+    let stop_smoke = Arc::new(AtomicBool::new(false));
+    let reader = windows_smoke::spawn(options.smoke_port, smoke_tx, stop_smoke.clone())
+        .context("could not start Smoke serial reader")?;
+    let smoke_state = state.clone();
+    let smoke_task = tokio::spawn(async move {
+        while let Some(event) = smoke_rx.recv().await {
+            if let Err(error) = record_smoke_event(&smoke_state, event) {
+                eprintln!("Could not process Smoke reading: {error:#}");
+            }
+        }
+    });
+    let result = loop {
+        match run_controller(state.clone()).await {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "Pit Boss BLE unavailable: {error:#}; retrying while the Smoke dashboard stays up"
+                );
+                if state.settings.lock().is_ok_and(|settings| settings.enabled) {
+                    stop_control(&state, "Pit Boss BLE disconnected");
+                }
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(10)) => {}
+                    _ = state.shutdown.notified() => break Ok(()),
+                    _ = tokio::signal::ctrl_c() => break Ok(()),
+                }
+            }
+        }
+    };
+    stop_smoke.store(true, Ordering::Relaxed);
+    let _ = reader.join();
+    smoke_task.abort();
+    let _ = smoke_task.await;
     web_task.abort();
     let _ = web_task.await;
     result
@@ -1524,7 +1951,199 @@ fn looks_like_pit_boss(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_pit_boss;
+    use super::*;
+
+    #[test]
+    fn controller_rejects_implausible_grate_or_factory_chamber() {
+        assert_eq!(control_sensor_fault(225.0, 225, 225), None);
+        assert!(control_sensor_fault(76.0, 225, 225).is_some());
+        assert!(control_sensor_fault(225.0, 330, 225).is_some());
+        assert!(control_sensor_fault(225.0, 99, 225).is_some());
+        assert!(control_sensor_fault(400.0, 225, 225).is_some());
+        assert!(control_sensor_fault(225.0, 420, 225).is_some());
+    }
+
+    #[test]
+    fn selected_probe_never_falls_back_when_disconnected_or_stale() {
+        let mut smoke = SmokeCache {
+            probe2_f: Some(76.0),
+            last_at: Some(Instant::now()),
+            connected: true,
+            ..SmokeCache::default()
+        };
+        let ble_at = Some(Instant::now());
+        assert_eq!(
+            fresh_grate(
+                GrateSource::SmokeBottom,
+                Some(225),
+                Some(150),
+                ble_at,
+                &smoke
+            ),
+            Some(76.0)
+        );
+        smoke.probe2_f = None;
+        assert_eq!(
+            fresh_grate(
+                GrateSource::SmokeBottom,
+                Some(225),
+                Some(150),
+                ble_at,
+                &smoke
+            ),
+            None
+        );
+        smoke.probe2_f = Some(76.0);
+        smoke.last_at = Some(Instant::now() - SMOKE_STALE - Duration::from_secs(1));
+        assert_eq!(
+            fresh_grate(
+                GrateSource::SmokeBottom,
+                Some(225),
+                Some(150),
+                ble_at,
+                &smoke
+            ),
+            None
+        );
+        assert_eq!(
+            fresh_grate(
+                GrateSource::PitBossProbe1,
+                Some(225),
+                Some(150),
+                ble_at,
+                &smoke
+            ),
+            Some(225.0)
+        );
+        assert_eq!(
+            fresh_grate(
+                GrateSource::PitBossProbe1,
+                Some(225),
+                Some(150),
+                None,
+                &smoke
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_source_disables_existing_control() {
+        let settings = ControlSettings {
+            enabled: true,
+            target_f: 225,
+            grate_source: GrateSource::PitBossProbe1,
+            generation: 0,
+            command_in_flight: false,
+            integral: 23.0,
+            last_command_at: None,
+            last_command_epoch: None,
+            last_sample_at: Some(Instant::now()),
+            fault: None,
+            pid: PidTelemetry::default(),
+        };
+        let latest = DashboardState {
+            timestamp: Some(epoch_now()),
+            ambient_f: Some(225.0),
+            meat_f: Some(150),
+            pit_boss_probe1_f: Some(225),
+            pit_boss_probe2_f: Some(150),
+            smoke_probe1_f: None,
+            smoke_probe2_f: Some(76.0),
+            smoke_timestamp: None,
+            smoke_status: "live".to_owned(),
+            grate_source: GrateSource::PitBossProbe1,
+            chamber_f: Some(225),
+            factory_setpoint_f: Some(225),
+            control_enabled: true,
+            target_f: 225,
+            last_command_at: None,
+            fault: None,
+            pid: PidTelemetry::default(),
+        };
+        let state = WebState {
+            latest: Arc::new(Mutex::new(latest)),
+            settings: Arc::new(Mutex::new(settings)),
+            smoke: Arc::new(Mutex::new(SmokeCache {
+                probe2_f: Some(76.0),
+                last_at: Some(Instant::now()),
+                connected: true,
+                ..SmokeCache::default()
+            })),
+            database: Arc::new(Mutex::new({
+                let connection = Connection::open_in_memory().unwrap();
+                connection
+                    .execute_batch("CREATE TABLE smoke_samples (timestamp INTEGER, probe1_f REAL, probe2_f REAL)")
+                    .unwrap();
+                connection
+            })),
+            shutdown: Arc::new(Notify::new()),
+        };
+        let response = api_control(
+            State(state.clone()),
+            Json(ControlRequest {
+                enabled: None,
+                target_f: None,
+                grate_source: Some(GrateSource::SmokeBottom),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!response.control_enabled);
+        assert_eq!(response.grate_source, GrateSource::SmokeBottom);
+        assert_eq!(response.ambient_f, Some(76.0));
+        assert_eq!(state.settings.lock().unwrap().integral, 0.0);
+        assert!(response.fault.unwrap().contains("source changed"));
+        state.settings.lock().unwrap().command_in_flight = true;
+        let rejected = api_control(
+            State(state.clone()),
+            Json(ControlRequest {
+                enabled: None,
+                target_f: None,
+                grate_source: Some(GrateSource::PitBossProbe1),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::CONFLICT);
+        state.settings.lock().unwrap().command_in_flight = false;
+
+        record_smoke_event(
+            &state,
+            windows_smoke::Event::Reading(crate::smoke::Reading {
+                probe1_f: None,
+                probe2_f: Some(76.0),
+                radio_id: 12345,
+            }),
+        )
+        .unwrap();
+        let reading = api_state(State(state.clone())).await.0;
+        assert_eq!(reading.ambient_f, Some(76.0));
+        assert_eq!(reading.smoke_status, "live");
+        let logged: i64 = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM smoke_samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logged, 1);
+        state.settings.lock().unwrap().enabled = true;
+        record_smoke_event(&state, windows_smoke::Event::Disconnected).unwrap();
+        let stopped = api_state(State(state.clone())).await.0;
+        assert_eq!(stopped.ambient_f, None);
+        assert!(!stopped.control_enabled);
+        assert!(stopped.fault.unwrap().contains("Smoke serial disconnected"));
+        let rejected = api_control(
+            State(state),
+            Json(ControlRequest {
+                enabled: Some(true),
+                target_f: None,
+                grate_source: None,
+            }),
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::CONFLICT);
+    }
 
     #[test]
     fn recognizes_likely_names_case_insensitively() {

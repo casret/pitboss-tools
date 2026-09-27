@@ -7,8 +7,12 @@ use clap::{Parser, Subcommand};
 mod codec;
 #[cfg(target_os = "windows")]
 mod config;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod smoke;
 #[cfg(target_os = "windows")]
 mod windows_ble;
+#[cfg(target_os = "windows")]
+mod windows_smoke;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,6 +84,10 @@ enum Command {
         /// Start the guarded setpoint controller enabled.
         #[arg(long)]
         control: bool,
+
+        /// ESP32 Smoke USB serial port (default: COM3).
+        #[arg(long, default_value = "COM3")]
+        smoke_port: String,
     },
 }
 
@@ -104,7 +112,8 @@ async fn main() -> Result<()> {
             database,
             target,
             control,
-        } => serve(bind, database, target, control).await,
+            smoke_port,
+        } => serve(bind, database, target, control, smoke_port).await,
     }
 }
 
@@ -134,12 +143,19 @@ async fn set_temperature(temperature: u16) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-async fn serve(bind: SocketAddr, database: PathBuf, target: u16, control: bool) -> Result<()> {
+async fn serve(
+    bind: SocketAddr,
+    database: PathBuf,
+    target: u16,
+    control: bool,
+    smoke_port: String,
+) -> Result<()> {
     windows_ble::serve(windows_ble::ServeOptions {
         bind,
         database,
         target_f: target,
         control_enabled: control,
+        smoke_port,
     })
     .await
 }
@@ -180,7 +196,13 @@ async fn set_temperature(_temperature: u16) -> Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn serve(_bind: SocketAddr, _database: PathBuf, _target: u16, _control: bool) -> Result<()> {
+async fn serve(
+    _bind: SocketAddr,
+    _database: PathBuf,
+    _target: u16,
+    _control: bool,
+    _smoke_port: String,
+) -> Result<()> {
     anyhow::bail!(
         "the dashboard currently requires the Windows build; run pitboss-tools.exe on Windows"
     )

@@ -7,9 +7,12 @@ The native Windows Rust binary uses the Windows BLE stack and provides a local
 web UI/API. Automatic control defaults off and only adjusts the factory
 setpoint; it never operates the auger, fan, igniter, or mains power directly.
 
-A separate receive-only ESP32/nRF24L01+ USB-serial firmware for the original
-two-channel ThermoWorks Smoke lives in
+The original two-channel ThermoWorks Smoke has separate receive-only
+ESP32/nRF24L01+ firmware in
 [firmware/thermoworks-smoke](firmware/thermoworks-smoke/README.md).
+The Windows dashboard can also read its USB serial stream without pairing or
+turning off the handheld receiver. Only one program can open the COM port at a
+time: close any serial monitor before starting `serve`.
 
 ## Build
 
@@ -67,17 +70,24 @@ running the inspection.
 
 ## Dashboard and guarded control
 
-The `serve` command records every temperature frame in SQLite and serves a
-single-page dashboard on loopback. It treats probe 1 as grate ambient and probe
-2 as meat, matching this PBV4DX setup:
+The `serve` command records temperature frames in SQLite and serves a
+single-page dashboard on loopback. By default it selects **Smoke bottom / probe
+2** for grate temperature, and displays the Pit Boss probe 2 as meat. The
+dashboard's grate-source selector can instead choose Smoke top or either Pit
+Boss probe. Change the COM port with `--smoke-port` if Windows assigned
+something other than COM3:
 
 ```powershell
-.\pitboss-tools.exe serve --database pitboss.sqlite3 --target 225 --control
+.\pitboss-tools.exe serve --database pitboss.sqlite3 --target 225 --smoke-port COM3
 ```
 
-The `--control` flag is required to start automatic control. Without it, the
-server remains monitor-only. The dashboard can enable/disable control and
-change the grate target. Control adjusts only the Pit Boss factory temperature
+Control defaults off. The optional `--control` flag requests control at
+startup; using the dashboard to enable it *after* all selected sensors are
+fresh and the already-running smoker is hot is safer. Selecting a different
+grate source automatically disables control and clears the integral; it does
+not silently fall back to another probe if the selected source disconnects.
+The dashboard can enable/disable control and change the grate target. Control
+adjusts only the Pit Boss factory temperature
 setpoint; it never switches mains power or directly operates the auger, fan, or
 igniter.
 
@@ -90,15 +100,24 @@ grill_password = "your-grill-password"
 ```
 
 Keep `conf.toml` private. The server does not print the password. Its guarded
-controller stops on stale/disconnected probes, over-temperature, possible
-flameout, failed commands, and enforces 5°F setpoint increments plus a
-120-second command interval. It starts only after the smoker is already on;
-remote startup is not implemented.
+controller stops on stale/disconnected selected grate data (Smoke: 30 seconds;
+Pit Boss BLE: 60 seconds), BLE disconnect, over-temperature, possible
+flameout, and failed commands. It enforces 5°F setpoint increments plus a
+120-second command interval, requires recent Pit Boss BLE telemetry even when
+using Smoke for grate, and will not arm until the factory chamber reads at
+least 100°F. It also stops if the chamber rises more than 100°F above the
+grate target or differs from the selected grate probe by over 100°F; these
+conservative thresholds may need tuning after a monitored cook. It does not
+resume automatically after a sensor fault. Remote startup is not implemented.
 
-The SQLite `samples` table contains timestamped grate, meat, chamber, factory
-setpoint, control-enabled, and target values. Each guarded-control tick is also
-written to `control_events` with the error, integral, P/I/D terms, clamped
-adjustment, recommended factory setpoint, action, and reason. The dashboard
+The SQLite `samples` table contains timestamped selected grate (with source),
+meat, chamber, factory setpoint, control-enabled, and target values; the
+`smoke_samples` table stores both Smoke probes without the transmitter ID.
+Each guarded-control tick is also
+written to `control_events` with the selected grate source, error, integral,
+P/I/D terms, clamped adjustment, recommended factory setpoint, action, and
+reason. Disabling control cannot retract a factory command already in flight;
+source changes are blocked until such a command finishes. The dashboard
 shows the same live calculation and history. The optional smoker-side HTTP service can be inspected over BLE with:
 
 ```powershell
@@ -121,6 +140,8 @@ The JSON endpoints are:
 - `GET /api/state` (live temperatures plus the latest P/I/D calculation)
 - `GET /api/history?limit=100`
 - `GET /api/control-events?limit=100`
-- `POST /api/control` with `{ "enabled": true, "target_f": 225 }`
+- `POST /api/control` with `{ "enabled": true, "target_f": 225 }` or
+  `{ "grate_source": "smoke_bottom" }` (also `smoke_top`, `pit_boss_probe1`,
+  `pit_boss_probe2`; selecting a new source turns control off)
 - `POST /api/shutdown` to stop the dashboard and BLE connection (the smoker
   remains on its current factory setting)
