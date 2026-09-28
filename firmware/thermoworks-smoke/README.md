@@ -36,6 +36,32 @@ the ESP32 end in the wiring photos; they are **not a universal color standard**.
 Before powering a rebuilt harness, verify each radio-end connection against
 its pin and check for a VCC–GND short rather than trusting color alone.
 
+**ESP32 empty gaps:** look at the board's printed/component side with its USB
+connector on the **left**. On the long header that starts with `3V3, GND` at
+the USB end, read **left to right** toward the ESP32 antenna. Every position
+below is one adjacent pin; **EMPTY means no wire**:
+
+| Position | ESP32 label | Wire |
+| ---: | --- | --- |
+| 1 | 3V3 | Red |
+| 2 | GND | Tan/brown |
+| 3 | D15 | **EMPTY** |
+| 4 | D2 | **EMPTY** |
+| 5 | D4 | Gray (CE) |
+| 6 | RX2 | **EMPTY** |
+| 7 | TX2 | **EMPTY** |
+| 8 | D5 | Green/teal (CSN) |
+| 9 | D18 | Purple (SCK) |
+| 10 | D19 | Blue (MISO) |
+| 11 | D21 | **EMPTY** |
+| 12 | RX0 | **EMPTY** |
+| 13 | TX0 | **EMPTY** |
+| 14 | D22 | **EMPTY** |
+| 15 | D23 | Yellow (MOSI) |
+
+The radio's only empty position is **IRQ**: antenna-side row, fourth pin
+from the left in the orientation above. Do not insert a wire there.
+
 Unplug USB before changing wiring. Inspect the radio's VCC and GND solder
 pads for a bridge before powering it, and never reuse a module that overheated
 after 5 V was applied. Use short wires and, if the module resets or reception
