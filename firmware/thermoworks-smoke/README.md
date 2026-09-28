@@ -4,7 +4,8 @@ Small, receive-only firmware for the **original two-channel ThermoWorks Smoke**
 and an ESP32-WROOM-32 development board (PlatformIO `esp32dev`, Arduino). An
 nRF24L01+ listens on hardware VSPI; no Wi-Fi, BLE, pairing, MQTT, cloud, or
 handheld-receiver shutdown is involved. The handheld receiver can stay on.
-This is separate from the Pit Boss BLE dashboard.
+The firmware is separate from the Pit Boss BLE code; the Windows dashboard can
+read its USB serial stream.
 
 The RF settings, CRC search, 5-byte radio ID and 21-byte payload layout follow
 [stefslon/esphome-thermoworks-smoke](https://github.com/stefslon/esphome-thermoworks-smoke/tree/9da52e863b184717864a4c9cbc4b9a72e7d79ae6)
@@ -15,16 +16,25 @@ handheld. Other transmitters and board variants have not been validated.
 
 ## Wiring
 
-| nRF24L01+ | ESP32-WROOM-32 |
-| --- | --- |
-| VCC | **3V3 only, never 5V** |
-| GND | GND |
-| CE | GPIO 4 |
-| CSN | GPIO 5 |
-| SCK | GPIO 18 |
-| MOSI | GPIO 23 |
-| MISO | GPIO 19 |
-| IRQ | Not connected |
+| nRF24L01+ | ESP32-WROOM-32 label | Current harness color |
+| --- | --- | --- |
+| VCC | **3V3 only, never VIN/5V** | Red |
+| GND | GND | Tan/brown |
+| CE | D4 / GPIO 4 | Gray |
+| CSN | D5 / GPIO 5 | Green/teal |
+| SCK | D18 / GPIO 18 | Purple |
+| MOSI | D23 / GPIO 23 | Yellow |
+| MISO | D19 / GPIO 19 | Blue |
+| IRQ | Not connected | None |
+
+**Radio orientation:** with the component side facing you, antenna at the top
+and 2×4 pins at the bottom, the row **toward the antenna** reads left to right
+`VCC (red) · CSN (green) · MOSI (yellow) · IRQ (empty)`. The row **toward the
+board edge** reads `GND (tan) · CE (gray) · SCK (purple) · MISO (blue)`.
+The square pad identifies GND. The colors above identify the wires seen at
+the ESP32 end in the wiring photos; they are **not a universal color standard**.
+Before powering a rebuilt harness, verify each radio-end connection against
+its pin and check for a VCC–GND short rather than trusting color alone.
 
 Unplug USB before changing wiring. Inspect the radio's VCC and GND solder
 pads for a bridge before powering it, and never reuse a module that overheated
