@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Fish/bash-friendly WSL launcher for the native Windows Pit Boss dashboard."""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+PS = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+DIRECTORY = os.environ.get("PITBOSS_WINDOWS_DIR", r"C:\Users\casret\pitboss-pid")
+URL = "http://127.0.0.1:8787"
+SOURCES = {
+    "pitboss-1": "pit_boss_probe1", "pitboss-2": "pit_boss_probe2",
+    "smoke-top": "smoke_top", "smoke-bottom": "smoke_bottom",
+}
+
+
+def quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def powershell(code):
+    code = (
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; try { "
+        + code
+        + " } catch { if ($_.ErrorDetails.Message) { [Console]::Error.WriteLine($_.ErrorDetails.Message) }"
+        " else { [Console]::Error.WriteLine($_.Exception.Message) }; exit 1 }"
+    )
+    encoded = base64.b64encode(code.encode("utf-16-le")).decode("ascii")
+    # Real files avoid inherited stdout pipes keeping WSL alive after Windows
+    # Start-Process launches the persistent dashboard.
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        result = subprocess.run(
+            [PS, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            stdout=out, stderr=err, timeout=25, check=False,
+        )
+        out.seek(0)
+        text = out.read().decode("utf-8-sig", errors="replace").strip()
+        err.seek(0)
+        error = err.read().decode("utf-8-sig", errors="replace").strip()
+    if result.returncode:
+        raise RuntimeError(error or text or "Windows command failed")
+    return text
+
+
+def api(path, body=None):
+    command = "Invoke-WebRequest -UseBasicParsing -TimeoutSec 4 -Uri " + quote(URL + path)
+    if body is not None:
+        command += " -Method Post -ContentType application/json -Body " + quote(json.dumps(body))
+    text = powershell("$r=" + command + "; if ($r.Content) { [Console]::Write($r.Content) }")
+    return json.loads(text) if text else None
+
+
+def state_if_running():
+    try:
+        return api("/api/state")
+    except RuntimeError:
+        return None
+
+
+def show(state):
+    def temp(value):
+        return "--" if value is None else f"{value:.1f} F"
+    print(URL)
+    print(f"Control: {'ON' if state['control_enabled'] else 'OFF'} | target: {state['target_f']} F")
+    print(f"Grate: {state['grate_source']} = {temp(state['ambient_f'])}")
+    print(f"Chamber: {temp(state['chamber_f'])} | factory: {temp(state['factory_setpoint_f'])} | meat: {temp(state['meat_f'])}")
+    print(f"Smoke: {state['smoke_status']} | top: {temp(state['smoke_probe1_f'])} | bottom: {temp(state['smoke_probe2_f'])}")
+    if state.get("last_control_action"):
+        print("Last action: " + state["last_control_action"])
+    if state.get("fault"):
+        print("FAULT: " + state["fault"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="start monitor-only and open dashboard")
+    start.add_argument("--grate", choices=SOURCES, default="pitboss-1")
+    start.add_argument("--target", type=int, default=225)
+    start.add_argument("--smoke-port", default="COM3")
+    start.add_argument("--no-browser", action="store_true")
+    commands.add_parser("status", help="show current readings and safety faults")
+    control = commands.add_parser("control", help="explicitly enable or disable guarded control")
+    control.add_argument("mode", choices=["on", "off"])
+    source = commands.add_parser("source", help="choose grate probe; turns control off")
+    source.add_argument("probe", choices=SOURCES)
+    target = commands.add_parser("target", help="set grate target in 5 F steps, 130..350")
+    target.add_argument("fahrenheit", type=int)
+    commands.add_parser("open", help="open dashboard in Windows browser")
+    commands.add_parser("stop", help="stop app; smoker remains at its factory setting")
+    args = parser.parse_args()
+    if args.command in ("start", "target"):
+        value = args.target if args.command == "start" else args.fahrenheit
+        if not 130 <= value <= 350 or value % 5:
+            parser.error("target must be 130..350 F in 5 F increments")
+    if args.command == "start":
+        if state_if_running() is not None:
+            raise RuntimeError("Dashboard already running; use pitboss status/open/source/target instead.")
+        if not args.smoke_port.isalnum():
+            parser.error("Smoke port must be a Windows COM port such as COM3")
+        directory = quote(DIRECTORY)
+        arguments = f"serve --bind 127.0.0.1:8787 --database pitboss.sqlite3 --target {args.target} --smoke-port {args.smoke_port}"
+        launch = (
+            "$d=" + directory + "; $exe=Join-Path $d 'pitboss-tools.exe'; "
+            "if (!(Test-Path $exe)) { throw 'Windows executable not found' }; "
+            "Start-Process -FilePath $exe -WorkingDirectory $d -ArgumentList " + quote(arguments)
+            + " -RedirectStandardOutput (Join-Path $d 'serve.stdout.log')"
+            " -RedirectStandardError (Join-Path $d 'serve.stderr.log')"
+        )
+        # WMI creates a genuinely detached Windows process. Directly launching
+        # Start-Process from WSL can keep the interop process alive indefinitely.
+        encoded_launch = base64.b64encode(launch.encode("utf-16-le")).decode("ascii")
+        powershell(
+            "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{"
+            "CommandLine=" + quote("powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded_launch)
+            + "; CurrentDirectory=" + directory + "}; "
+            "if ($r.ReturnValue -ne 0) { throw ('Launch failed: '+$r.ReturnValue) }"
+        )
+        until = time.monotonic() + 20
+        while state_if_running() is None:
+            if time.monotonic() >= until:
+                raise RuntimeError("Dashboard did not start; check serve.stderr.log in " + DIRECTORY)
+            time.sleep(.5)
+        state = api("/api/control", {"enabled": False, "grate_source": SOURCES[args.grate]})
+        show(state)
+        print("Monitor-only. Once the already-running smoker and grate probe are ready: pitboss control on")
+        if not args.no_browser:
+            powershell("Start-Process " + quote(URL))
+    elif args.command == "status":
+        show(api("/api/state"))
+    elif args.command == "control":
+        show(api("/api/control", {"enabled": args.mode == "on"}))
+    elif args.command == "source":
+        show(api("/api/control", {"enabled": False, "grate_source": SOURCES[args.probe]}))
+    elif args.command == "target":
+        show(api("/api/control", {"target_f": args.fahrenheit}))
+    elif args.command == "open":
+        powershell("Start-Process " + quote(URL))
+    elif args.command == "stop":
+        api("/api/control", {"enabled": False})
+        api("/api/shutdown", {})
+        print("App shutdown requested. Smoker stays at its current factory setting.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.TimeoutExpired:
+        print("pitboss: Windows command timed out; run pitboss status before retrying.", file=sys.stderr)
+        sys.exit(1)
+    except (RuntimeError, OSError, ValueError) as error:
+        print("pitboss: " + str(error), file=sys.stderr)
+        sys.exit(1)

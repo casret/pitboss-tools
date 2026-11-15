@@ -38,6 +38,8 @@
     <div class="card"><div class="label">Meat probe</div><div class="value" id="meat">--</div></div>
     <div class="card"><div class="label">Factory chamber</div><div class="value" id="chamber">--</div></div>
     <div class="card"><div class="label">Factory setpoint</div><div class="value" id="setpoint">--</div></div>
+    <div class="card"><div class="label">Smoke top / probe 1</div><div class="value" id="smoke-top">--</div><div class="muted" id="smoke-top-status">Waiting…</div></div>
+    <div class="card"><div class="label">Smoke bottom / probe 2</div><div class="value" id="smoke-bottom">--</div><div class="muted" id="smoke-bottom-status">Waiting…</div></div>
   </div>
   <form id="source-form">
     <label>Grate source <select id="grate-source">
@@ -49,7 +51,6 @@
     <button type="submit" class="secondary">Use this source</button>
     <span class="muted">Changing source turns control off; no automatic fallback.</span>
   </form>
-  <div class="muted" id="sensor-details">Waiting for sensor data…</div>
   <h2>Guarded PI calculation</h2>
   <div class="grid">
     <div class="card"><div class="label">Error (target − grate)</div><div class="value" id="error">--</div></div>
@@ -88,7 +89,11 @@ const escapeHtml = value => String(value ?? '--').replace(/[&<>"']/g, character 
 function render(s) {
   $('ambient').textContent = f(s.ambient_f);
   $('grate-source').value = s.grate_source;
-  $('sensor-details').textContent = `Smoke ${s.smoke_status} (last reading ${time(s.smoke_timestamp)}): top ${f(s.smoke_probe1_f)}, bottom ${f(s.smoke_probe2_f)} · Pit Boss: probe 1 ${f(s.pit_boss_probe1_f)}, probe 2 ${f(s.pit_boss_probe2_f)}`;
+  $('smoke-top').textContent = f(s.smoke_probe1_f);
+  $('smoke-bottom').textContent = f(s.smoke_probe2_f);
+  const smokeStatus = `${s.smoke_status} · last reading ${time(s.smoke_timestamp)}`;
+  $('smoke-top-status').textContent = smokeStatus;
+  $('smoke-bottom-status').textContent = smokeStatus;
   $('meat').textContent = f(s.meat_f);
   $('chamber').textContent = f(s.chamber_f);
   $('setpoint').textContent = f(s.factory_setpoint_f);

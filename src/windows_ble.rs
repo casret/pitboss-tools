@@ -523,8 +523,44 @@ async fn send_authenticated_temperature(
             "psw": hex_encode(&encoded_password),
         }),
     )
-    .await?;
+    .await
+    .context("temperature command response failed")?;
     Ok(())
+}
+
+fn may_reconcile_temperature(error: &anyhow::Error) -> bool {
+    error.to_string() == "temperature command response failed"
+        && error
+            .chain()
+            .any(|cause| cause.to_string() == "timed out waiting for Pit Boss RPC response")
+}
+
+// Never retry an uncertain write. Confirm using a new debug temperature
+// notification received after the RPC finished (not cached dashboard state).
+async fn confirm_factory_setpoint(
+    state: &WebState,
+    notifications: &mut Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
+    desired: u16,
+) -> Result<()> {
+    let debug_uuid = Uuid::parse_str("306d4f53-5f44-4247-5f6c-6f675f5f5f30")?;
+    timeout(Duration::from_secs(15), async {
+        while let Some(notification) = notifications.next().await {
+            if notification.uuid != debug_uuid {
+                continue;
+            }
+            if let Ok(message) = std::str::from_utf8(&notification.value)
+                && let Some(report) = parse_temperature_report(message)
+            {
+                record_sample(state, &report)?;
+                if report.setpoint == Some(desired) {
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("BLE stream ended before setpoint confirmation")
+    })
+    .await
+    .context("factory setpoint not confirmed within 15 seconds; no retry sent")?
 }
 
 /// Sets only the factory controller's temperature setpoint. It never directly
@@ -1767,11 +1803,15 @@ async fn guarded_control_tick(
         match state.settings.lock() {
             Ok(mut current) if current.enabled && current.generation == settings.generation => {
                 current.command_in_flight = true;
+                // Reserve the rate limit before any write, including an
+                // uncertain/failed command. Never immediately retry it.
+                current.last_command_at = Some(Instant::now());
+                current.last_command_epoch = Some(epoch_now());
             }
             _ => return,
         }
         telemetry.last_control_action = Some("command pending".to_owned());
-        match send_authenticated_temperature(
+        let command = send_authenticated_temperature(
             smoker,
             rpc_data,
             rpc_tx,
@@ -1779,8 +1819,15 @@ async fn guarded_control_tick(
             notifications,
             desired,
         )
-        .await
-        {
+        .await;
+        let command = match command {
+            Ok(()) => confirm_factory_setpoint(state, notifications, desired).await,
+            Err(error) if may_reconcile_temperature(&error) => {
+                confirm_factory_setpoint(state, notifications, desired).await
+            }
+            Err(error) => Err(error),
+        };
+        match command {
             Ok(()) => {
                 let now = Instant::now();
                 let epoch = epoch_now();
@@ -1797,7 +1844,7 @@ async fn guarded_control_tick(
                         current.integral = integral;
                         telemetry.last_control_at = Some(epoch);
                         telemetry.last_control_action =
-                            Some(format!("command accepted: factory {desired}°F"));
+                            Some(format!("telemetry confirmed: factory {desired}°F"));
                         current.pid = telemetry.clone();
                         still_current = true;
                     }
@@ -1952,6 +1999,20 @@ fn looks_like_pit_boss(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_only_missing_temperature_response_not_auth_or_rejection() {
+        let uncertain = anyhow::anyhow!("timed out waiting for Pit Boss RPC response")
+            .context("temperature command response failed");
+        assert!(may_reconcile_temperature(&uncertain));
+        assert!(!may_reconcile_temperature(&anyhow::anyhow!(
+            "timed out waiting for Pit Boss RPC response"
+        )));
+        assert!(!may_reconcile_temperature(
+            &anyhow::anyhow!("Pit Boss rejected RPC request: unauthorized")
+                .context("temperature command response failed")
+        ));
+    }
 
     #[test]
     fn controller_rejects_implausible_grate_or_factory_chamber() {

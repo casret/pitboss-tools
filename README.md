@@ -37,6 +37,44 @@ The executable will be at:
 target/x86_64-pc-windows-gnu/release/pitboss-tools.exe
 ```
 
+## WSL / fish command
+
+On this machine, `~/.local/bin/pitboss` links to `scripts/pitboss`. It uses
+Python 3 and Windows PowerShell internally; no PowerShell typing or Windows
+Python install is needed. The actual Rust program still runs on Windows for
+BLE and USB serial access.
+
+```fish
+pitboss start --grate pitboss-1 --target 225
+pitboss status
+pitboss control on
+pitboss control off
+pitboss source smoke-bottom
+pitboss target 225
+pitboss open
+pitboss stop
+```
+
+`start` always starts monitor-only, defaults to Pit Boss probe 1 in this
+launcher, and opens the dashboard. The native `serve` default is still Smoke
+bottom. Source choices: `pitboss-1`, `pitboss-2`, `smoke-top`, `smoke-bottom`.
+Use `--smoke-port COM3` or `--no-browser` with `start` if desired. `source`
+disables control. `stop` disables control and exits the app, leaving the
+smoker running at its last factory setting. Control must be explicitly armed
+after startup and after faults; never use it to start a cold smoker.
+
+Install the launcher elsewhere using:
+
+```fish
+mkdir -p ~/.local/bin
+ln -s /absolute/path/to/pitboss-tools/scripts/pitboss ~/.local/bin/pitboss
+```
+
+The launcher expects `C:\\Users\\casret\\pitboss-pid\\pitboss-tools.exe` and
+keeps the database/config/logs in that directory. Override the directory with
+`PITBOSS_WINDOWS_DIR` (a Windows path). Ensure `~/.local/bin` is on your fish
+PATH (`fish_add_path ~/.local/bin` if needed). Run `pitboss --help` for commands.
+
 ## First scan
 
 Power on the smoker controller without starting a cook, then run from
@@ -116,7 +154,13 @@ meat, chamber, factory setpoint, control-enabled, and target values; the
 Each guarded-control tick is also
 written to `control_events` with the selected grate source, error, integral,
 P/I/D terms, clamped adjustment, recommended factory setpoint, action, and
-reason. Disabling control cannot retract a factory command already in flight;
+reason. Factory commands are confirmed against subsequent BLE setpoint
+telemetry. If the temperature-command RPC reply times out, no retry is sent:
+the controller waits up to 15 seconds for the requested factory setpoint to
+appear in a temperature report, otherwise it stops. Authentication failures
+and explicit RPC errors are not treated as successes. Attempted commands also
+reserve the 120-second rate limit even if confirmation fails.
+Disabling control cannot retract a factory command already in flight;
 source changes are blocked until such a command finishes. The dashboard
 shows the same live calculation and history. The optional smoker-side HTTP service can be inspected over BLE with:
 
